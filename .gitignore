@@ -1,0 +1,26 @@
+# 依存パッケージ。vendor/ にコピー済みなので追跡しない。
+# package.json は vendor に何のバージョンを置いたかの記録として残すが、
+# lock は npm install しない以上いらない
+node_modules/
+/web-proto/package-lock.json
+
+# USI エンジン（YaneuraOu.wasm）は GPLv3 のため同梱しない。
+# 使う人が自分で置いたものを取り込まないよう除外する
+/web-proto/vendor/engine/
+
+# 作業用のメモ。手元には置いておくが公開はしない
+CLAUDE.md
+.claude/
+
+# 開発開始時点の要件書。**いま作ってあるものとは中身が食い違う**
+# （将棋倒しを必須としている、棋譜再生をやる前提になっている、土台が未定になっている）。
+# 設計思想の記録として手元には残すが、公開すると誤解を招くので上げない
+/将棋盤シミュレーター_仕様書.md
+
+# 元音源を直下に置いたときの保険。使うのは audio/ の ASCII 名のコピーだけ
+/web-proto/*.wav
+
+# OS が作るゴミ
+Thumbs.db
+desktop.ini
+.DS_Store

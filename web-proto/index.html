@@ -1,0 +1,506 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<!-- viewport-fit=cover: ノッチやホームバーの下まで盤を広げる。UI 側は safe-area で避ける。
+     user-scalable=no はページ側の拡大を止める（盤の拡大はピンチで別に扱う）。 -->
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<title>将棋盤シミュレーター</title>
+<!-- COOP/COEP を Service Worker で後付けする（USI エンジンの SharedArrayBuffer に要る）。
+     GitHub Pages はカスタムヘッダを返せないので、これが無いと公開先でだけエンジンが起動しない。
+     ローカルは serve.py がヘッダを返すので、このスクリプトは何もせず素通りする。
+
+     **type や defer を付けてはいけない。** 中で `document.currentScript.src` を見て
+     自分自身を Service Worker として登録するので、currentScript が null になると死ぬ。
+     **置き場所も web-proto/ 直下でなければいけない**（vendor/ に入れるとスコープが
+     /vendor/ になり、index.html にヘッダが付かない）。 -->
+<script src="./coi-serviceworker.js"></script>
+<style>
+  /* 駒字の書体。fonts/koma.woff2 を置くと駒の字がそれになる。
+     置かなければ 404 になるだけで、src/piece.js の FONT が次の候補に落ちる。
+     実物の駒書体（錦旗・水無瀬など）は無料では手に入らないので、
+     入れるなら毛筆・行書系のフォントを使う。使う字は20字ほどなのでサブセット化すると軽い。 */
+  @font-face {
+    font-family: "KomaFont";
+    src: url("./fonts/koma.woff2") format("woff2");
+    font-display: block;
+  }
+  :root {
+    color-scheme: dark;
+    --sat: env(safe-area-inset-top, 0px);
+    --sab: env(safe-area-inset-bottom, 0px);
+    --sal: env(safe-area-inset-left, 0px);
+    --sar: env(safe-area-inset-right, 0px);
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; overflow: hidden;
+    background: #1b1815; color: #e8e2d8;
+    font: 13px/1.6 "Yu Gothic UI", "Meiryo", system-ui, sans-serif; }
+
+  /* 盤は全画面。設定はダイアログなので、画面を割かない。 */
+  #app { position: fixed; inset: 0; }
+  #app canvas { display: block; width: 100%; height: 100%;
+    /* ページ側のスクロール・ピンチズーム・ダブルタップズームを入れない。
+       盤のピンチは「視点」モードで自前に扱う。 */
+    touch-action: none; user-select: none; -webkit-user-select: none;
+    -webkit-tap-highlight-color: transparent; }
+
+  /* 上部の3つ。☗＝駒を動かす、🎥＝視点を動かす、⚙＝設定。
+     ☗と🎥は排他の操作モードで、指ではどちらを動かすかを先に決める。 */
+  #topbar { position: fixed; z-index: 6; display: flex; gap: 4px;
+    top: calc(var(--sat) + 8px); left: 50%; transform: translateX(-50%);
+    background: rgba(24,21,18,.72); backdrop-filter: blur(8px);
+    border: 1px solid rgba(255,255,255,.12); border-radius: 10px; padding: 4px; }
+  #topbar button { min-width: 68px; padding: 9px 12px; cursor: pointer;
+    font: inherit; font-size: 13px; color: #c4bcb0; white-space: nowrap;
+    background: transparent; border: 0; border-radius: 7px; }
+  #topbar button.on { background: #c9a35e; color: #221c14; font-weight: 700; }
+  #topbar .ic { font-size: 15px; margin-right: 4px; }
+
+  /* 視点のプリセット。**「視点」モードのときだけ出す**（駒モードでは視点が動かないので、
+     触れないものを見せない）。角度（真上／斜め）と寄り（近／中／遠）の2列。 */
+  #campreset { position: fixed; z-index: 6; display: flex; gap: 4px; align-items: center;
+    bottom: calc(var(--sab) + 10px); left: 50%; transform: translateX(-50%);
+    background: rgba(24,21,18,.72); backdrop-filter: blur(8px);
+    border: 1px solid rgba(255,255,255,.12); border-radius: 10px; padding: 4px 8px; }
+  #campreset[hidden] { display: none; }
+  #campreset .lb { font-size: 11px; color: #9a9186; padding: 0 4px 0 2px; }
+  #campreset .lb + .lb, #campreset button + .lb { margin-left: 6px; }
+  #campreset button { min-width: 48px; padding: 8px 10px; cursor: pointer;
+    font: inherit; font-size: 13px; color: #c4bcb0; white-space: nowrap;
+    background: transparent; border: 0; border-radius: 7px; }
+  #campreset button.on { background: #c9a35e; color: #221c14; font-weight: 700; }
+
+  /* 選んだ駒に出るボタン。駒をつまんで、動かさずに離すと出る。
+     成／不成が右上、向き変更が左上。駒には重ねない（重ねると駒を掴む操作と食い合う）。
+     位置は駒を画面に投影して決める。固定の px でずらすと視点の角度によって駒に被る。 */
+  .pbtn { position: fixed; z-index: 7; width: 46px; height: 46px; padding: 0;
+    display: grid; place-items: center;
+    transform: translate(-50%, -50%); cursor: pointer;
+    background: rgba(24,21,18,.86); backdrop-filter: blur(8px);
+    border: 1px solid rgba(255,255,255,.14); border-radius: 50%;
+    box-shadow: 0 3px 10px rgba(0,0,0,.45); }
+  .pbtn[hidden] { display: none; }
+  /* アイコンは**押した後の駒そのもの**を描く（`drawKomaIcon()`）。
+     歩を選べば、反転側には逆向きの歩、成側には「と」が出る。
+     記号で「向きが変わる」「裏返る」を描き分けようとしたが、どちらにも読めてしまい
+     意味が定まらなかったので駒の絵に変えた。
+     地色は駒の木地（#c9a15c あたり）と近いと溶けるので、ボタンは暗くして駒を主役にする。 */
+  .pbtn canvas { width: 34px; height: 34px; display: block; }
+
+  #scrim { position: fixed; inset: 0; z-index: 8; background: rgba(0,0,0,.45); }
+  #scrim[hidden] { display: none; }
+
+  /* 評価値の札。**盤を触りながら読み筋を見たい**ので、幕を張るダイアログにはしない。
+     半透明で、掴んで好きな所へ動かせる。 */
+  #eval { position: fixed; z-index: 7; left: 16px; bottom: 16px; width: min(320px, 90vw);
+    padding: 8px 12px 11px;
+    background: rgba(24,21,18,.74); backdrop-filter: blur(10px);
+    border: 1px solid rgba(255,255,255,.14); border-radius: 10px;
+    box-shadow: 0 6px 20px rgba(0,0,0,.5);
+    touch-action: none; user-select: none; -webkit-user-select: none; }
+  #eval[hidden] { display: none; }
+  #eval .head { display: flex; align-items: center; gap: 8px; cursor: grab; }
+  #eval .head:active { cursor: grabbing; }
+  #eval .grip { color: #6f665c; letter-spacing: -2px; font-size: 15px; }
+  #eval-score { flex: 1; font-size: 21px; font-weight: 700; }
+  #eval-score.think { color: #9a9186; }
+  #eval-close { padding: 2px 8px; cursor: pointer; font: inherit; line-height: 1.4;
+    color: #c4bcb0; background: transparent;
+    border: 1px solid rgba(255,255,255,.16); border-radius: 6px; }
+  #eval-meta { font-size: 11px; color: #9a9186; }
+  #eval-pv { margin-top: 5px; font-size: 12px; line-height: 1.85; color: #c4bcb0; }
+  #eval-pv b { color: #e8c88a; font-weight: 700; }
+
+  #settings, #bookmarks, #analysis { position: fixed; z-index: 9; top: 0; right: 0; height: 100%;
+    width: min(360px, 100%);
+    padding: calc(var(--sat) + 14px) calc(var(--sar) + 16px) calc(var(--sab) + 24px) 16px;
+    background: rgba(24,21,18,.96); backdrop-filter: blur(8px);
+    border-left: 1px solid rgba(255,255,255,.09);
+    overflow-y: auto; overscroll-behavior: contain; }
+  #settings[hidden], #bookmarks[hidden], #analysis[hidden] { display: none; }
+
+  /* 解析。押した時点の局面だけを読む（駒を持ち上げただけで局面が変わるので、
+     リアルタイムには走らせない）。 */
+  #btn-analyse:disabled { opacity: .5; cursor: default; }
+  #analysis-out { margin-top: 12px; }
+  .score { font-size: 26px; font-weight: 700; letter-spacing: .02em; }
+  .score.think { color: #9a9186; }
+  .meta { font-size: 11px; color: #9a9186; margin-bottom: 8px; }
+  .pv { font-size: 12px; line-height: 1.9; color: #c4bcb0; word-break: break-all; }
+  .pv b { color: #e8c88a; font-weight: 700; }
+  .warn { margin: 10px 0; padding: 9px 11px; font-size: 12px;
+    color: #f0d9a8; background: rgba(122,63,20,.45);
+    border: 1px solid rgba(232,200,138,.35); border-radius: 7px;
+    /* エンジンの置き方のような複数行の案内を textContent のまま出せるように */
+    white-space: pre-line; overflow-wrap: anywhere; }
+  .warn ul { margin: 5px 0 0; padding-left: 18px; }
+  .warn .go { margin-top: 8px; padding: 6px 12px; cursor: pointer; font: inherit;
+    color: #221c14; background: #c9a35e; border: 0; border-radius: 6px; }
+
+  /* 栞。挟んだ瞬間の画面をそのまま縮小して並べる。名前は付けないので、
+     どれがどれかは絵で見分ける。押せば戻る。 */
+  #btn-mark, #btn-analyse { width: 100%; margin-bottom: 12px; padding: 10px; cursor: pointer;
+    font: inherit; font-weight: 700; color: #221c14; background: #c9a35e;
+    border: 0; border-radius: 8px; }
+  #marklist { display: grid; gap: 10px; }
+  .mark { position: relative; padding: 0; cursor: pointer; overflow: hidden;
+    background: #2a251f; border: 1px solid rgba(255,255,255,.12); border-radius: 8px; }
+  /* 絵は 4:3 に切り出したものが入ってくる（main.js の snapshot）。
+     **ここで object-fit: cover をかけてはいけない。** 画面の形のまま保存した絵を
+     枠に合わせて伸ばすことになり、引き伸ばしでガビガビになる。 */
+  .mark img { display: block; width: 100%; aspect-ratio: 4 / 3; }
+  .mark:hover { border-color: #c9a35e; }
+  .mark .no { position: absolute; left: 6px; top: 6px;
+    padding: 1px 7px; border-radius: 999px; font-size: 11px;
+    color: #e8e2d8; background: rgba(24,21,18,.8); }
+  .mark .del { position: absolute; right: 6px; top: 6px; width: 26px; height: 26px;
+    display: grid; place-items: center; cursor: pointer; font: inherit; line-height: 1;
+    color: #e8e2d8; background: rgba(24,21,18,.8);
+    border: 1px solid rgba(255,255,255,.16); border-radius: 50%; }
+  .mark .del:hover { background: #7a2f22; }
+  #marklist .empty { padding: 18px 0; color: #9a9186; font-size: 12px; text-align: center; }
+
+  .sheet-head { display: flex; align-items: baseline; justify-content: space-between;
+    margin-bottom: 12px; }
+  #btn-close { padding: 6px 12px; cursor: pointer; font: inherit;
+    background: #332c25; color: #e8e2d8;
+    border: 1px solid rgba(255,255,255,.16); border-radius: 6px; }
+
+  h1 { font-size: 13px; margin: 0; letter-spacing: .04em; }
+  .sub { font-size: 11px; color: #9a9186; }
+  h2 { font-size: 11px; color: #9a9186; font-weight: 600; letter-spacing: .1em;
+    margin: 18px 0 8px; padding-bottom: 5px; border-bottom: 1px solid rgba(255,255,255,.09); }
+
+  .keys { display: grid; grid-template-columns: auto 1fr; gap: 4px 10px; font-size: 12px; }
+  .keys kbd { background: #2e2924; border: 1px solid rgba(255,255,255,.14);
+    border-bottom-width: 2px; border-radius: 4px; padding: 1px 6px;
+    font: 11px/1.5 ui-monospace, monospace; white-space: nowrap; }
+  .keys span { color: #c4bcb0; }
+  .keys .head { grid-column: 1 / 3; color: #e8c88a; font-size: 11px; letter-spacing: .06em;
+    margin-top: 6px; }
+  .keys .head:first-child { margin-top: 0; }
+
+  /* 高度な設定。**作り手が手触りを決めるための目盛り**なので、畳んでおく。
+     使う人に何本もスライダーを触らせるものではない、というのがこの企画の方針。 */
+  #advanced { margin-top: 18px; border-top: 1px solid rgba(255,255,255,.09); }
+  #advanced > summary { cursor: pointer; padding: 12px 0 10px; font-size: 11px;
+    color: #9a9186; font-weight: 600; letter-spacing: .1em; list-style: none; }
+  #advanced > summary::-webkit-details-marker { display: none; }
+  #advanced > summary::before { content: "▸ "; }
+  #advanced[open] > summary::before { content: "▾ "; }
+  #advanced > summary:hover { color: #c4bcb0; }
+  #advanced h3 { font-size: 11px; color: #9a9186; font-weight: 600; letter-spacing: .08em;
+    margin: 16px 0 6px; }
+
+  .p { display: grid; grid-template-columns: 96px 1fr 42px; align-items: center;
+    gap: 8px; margin-bottom: 7px; font-size: 11.5px; }
+  .p span { color: #c4bcb0; }
+  .p b { text-align: right; font-variant-numeric: tabular-nums; color: #e8c88a; font-weight: 600; }
+  .p input { width: 100%; accent-color: #c9a35e; }
+
+  .note { font-size: 11px; color: #857d73; margin-top: 14px; }
+  /* 既定の青リンクは暗い地の上で読めない */
+  .note a { color: #c9a35e; }
+
+  .seg { display: flex; gap: 6px; margin-bottom: 8px; }
+  .seg button { flex: 1; padding: 7px 0; cursor: pointer; font: inherit;
+    background: #2a2521; color: #c4bcb0;
+    border: 1px solid rgba(255,255,255,.14); border-radius: 6px; }
+  .seg button.on { background: #c9a35e; color: #221c14; border-color: #c9a35e; font-weight: 700; }
+  #params.dim { opacity: .38; }
+
+  .btns { display: flex; gap: 8px; margin-bottom: 14px; }
+  .btns button { flex: 1; padding: 9px 0; cursor: pointer; font: inherit; font-weight: 600;
+    background: #332c25; color: #e8e2d8;
+    border: 1px solid rgba(255,255,255,.16); border-radius: 6px; }
+  .btns button:hover { background: #3f372e; }
+
+  /* --- 狭い画面 -----------------------------------------------------------
+     **スマホは作り込まない方針だが、はみ出したままは危ない**。
+     実測（375px 幅）で上部の 5 つが 379px、視点のプリセットが 401px 要って
+     画面からこぼれていた。**文字を畳んで収める**（並びは変えない）。 */
+  @media (max-width: 430px) {
+    /* 上部はアイコンだけにする。☗🎥🔖🔍⚙ だけで区別はつく。
+       `font-size: 0` でラベルの文字を消し、アイコンの span で大きさを戻す。 */
+    #topbar { gap: 2px; padding: 3px; }
+    #topbar button { min-width: 0; padding: 9px 11px; font-size: 0; }
+    #topbar .ic { margin-right: 0; font-size: 18px; }
+
+    /* 視点のプリセットは「角度」「寄り」「向き」のラベルを落とす。
+       ボタンの文字（真上・斜め・近・中・遠・正面）自体が意味を持っているので困らない。 */
+    #campreset { gap: 3px; padding: 4px 6px; }
+    #campreset .lb { display: none; }
+    #campreset button { min-width: 0; padding: 8px 9px; font-size: 12px; }
+
+    /* 駒のボタン（成／向き）は指で押せる大きさを保ったまま、少しだけ詰める。 */
+    .pbtn { width: 42px; height: 42px; }
+  }
+</style>
+</head>
+<body>
+<div id="app"></div>
+
+<div id="topbar">
+  <button data-mode="piece" class="on"><span class="ic">☗</span>駒</button>
+  <button data-mode="camera"><span class="ic">🎥</span>視点</button>
+  <button id="btn-marks"><span class="ic">🔖</span>栞</button>
+  <button id="btn-analysis"><span class="ic">🔍</span>解析</button>
+  <button id="btn-settings"><span class="ic">⚙</span>設定</button>
+</div>
+
+<!-- 視点のプリセット。「視点」モードのときだけ出る。 -->
+<div id="campreset" hidden>
+  <span class="lb">角度</span>
+  <button data-angle="top" class="on">真上</button>
+  <button data-angle="tilt">斜め</button>
+  <span class="lb">寄り</span>
+  <button data-zoom="near">近</button>
+  <button data-zoom="mid" class="on">中</button>
+  <button data-zoom="far">遠</button>
+  <span class="lb">向き</span>
+  <button id="btn-square" title="盤の辺を画面と平行にする">正面</button>
+</div>
+
+<!-- 中の駒の絵は選んだ駒に応じて main.js が描く（drawKomaIcon）。
+     左＝向きを変えた後の駒、右＝成／不成にした後の駒。 -->
+<button id="btn-turn" class="pbtn" hidden title="向きを変える" aria-label="向きを変える"></button>
+<button id="btn-promote" class="pbtn" hidden title="成／不成" aria-label="成／不成"></button>
+
+<!-- 評価値の札。盤を触りながら読める。掴んで動かせる。 -->
+<div id="eval" hidden>
+  <div class="head">
+    <span class="grip">⋮⋮</span>
+    <span id="eval-score">—</span>
+    <button id="eval-close" title="閉じる">×</button>
+  </div>
+  <div id="eval-meta"></div>
+  <div id="eval-pv"></div>
+</div>
+
+<div id="scrim" hidden></div>
+<div id="analysis" hidden>
+  <div class="sheet-head">
+    <div>
+      <h1>解析</h1>
+    </div>
+    <button id="btn-analysis-close">閉じる</button>
+  </div>
+
+  <h2>手番</h2>
+  <div id="side" class="seg">
+    <button data-v="b" class="on">☗ 先手番</button>
+    <button data-v="w">☖ 後手番</button>
+  </div>
+
+  <h2>読みの深さ</h2>
+  <div id="depth" class="seg">
+    <button data-v="10">浅い</button>
+    <button data-v="16" class="on">ふつう</button>
+    <button data-v="22">深い</button>
+  </div>
+
+  <h2>最善手を盤に出す</h2>
+  <div id="arrow" class="seg">
+    <button data-v="on" class="on">矢印を出す</button>
+    <button data-v="off">出さない</button>
+  </div>
+
+  <h2>解析</h2>
+  <button id="btn-analyse">この局面を解析</button>
+  <div id="analysis-out"></div>
+
+  <div class="note" style="margin-top:14px">
+    駒を持ち上げただけでも盤面は変わってしまうので、<b>押したときの局面だけ</b>を読みます。
+    考えている間も盤は触れます。WASMエンジンはライセンスの都合で
+    <b>同梱していません</b>。使うには自分で置く必要があります。
+  </div>
+</div>
+<div id="bookmarks" hidden>
+  <div class="sheet-head">
+    <div>
+      <h1>栞</h1>
+    </div>
+    <button id="btn-marks-close">閉じる</button>
+  </div>
+  <button id="btn-mark">ここに栞を挟む</button>
+  <div id="marklist"></div>
+</div>
+<div id="settings" hidden>
+  <div class="sheet-head">
+    <div>
+      <h1>将棋盤シミュレーター</h1>
+    </div>
+    <button id="btn-close">閉じる</button>
+  </div>
+
+  <div class="btns">
+    <button id="btn-tidy">整列</button>
+    <button id="btn-reset">初期配置</button>
+  </div>
+
+  <div class="keys">
+    <div class="head">「駒」モード</div>
+    <kbd>ドラッグ</kbd><span>駒を掴んで運ぶ</span>
+    <kbd>その場で<br>離す</kbd><span>駒を置く。すぐ掴んで離すと駒の状態を変えられる。</span>
+    <kbd>右クリック</kbd><span>駒を裏返したり反転したりできる</span>
+    <div class="head">「視点」モード</div>
+    <kbd>1本指<br>左ドラッグ</kbd><span>視点を回す</span>
+    <kbd>2本指<br>中ドラッグ</kbd><span>視点を平行移動</span>
+    <kbd>ピンチ<br>ホイール</kbd><span>寄る / 引く</span>
+  </div>
+  <div class="note" style="margin-top:10px">
+    モードは上部の「☗駒」と「🎥視点」から切り替えられます。
+  </div>
+
+  <h2>描画品質</h2>
+  <div id="shadowq" class="seg">
+    <button data-v="high" class="on">影 高</button>
+    <button data-v="low">影 低</button>
+    <button data-v="off">影 切</button>
+  </div>
+  <div id="resolution" class="seg" style="margin-top:6px">
+    <button data-v="auto" class="on">解像度 自動</button>
+    <button data-v="one">等倍</button>
+  </div>
+  <div class="note" style="margin-top:0">
+    解像度「自動」は画面の細かさに合わせて最大2倍の大きさで描くので、高精細な画面ほど重くなります。
+  </div>
+
+  <h2>書体</h2>
+  <div id="style" class="seg">
+    <button data-v="kinki" class="on">錦旗</button>
+    <button data-v="minase">水無瀬</button>
+    <button data-v="ryoko">菱湖</button>
+    <button data-v="seian">清安</button>
+    <button data-v="ichiji">一字</button>
+    <button data-v="font">文字</button>
+  </div>
+
+  <h2>駒の仕上げ</h2>
+  <div id="finish" class="seg">
+    <button data-v="hori">彫</button>
+    <button data-v="ume">彫埋</button>
+    <button data-v="moriage" class="on">盛上</button>
+  </div>
+
+  <h2>駒を取ったとき</h2>
+  <div id="capture" class="seg">
+    <button data-v="off">取らない</button>
+    <button data-v="hand" class="on">手に持つ</button>
+    <button data-v="stand">駒台へ</button>
+  </div>
+
+  <h2>駒台に乗せたとき</h2>
+  <div id="standtidy" class="seg">
+    <button data-v="on" class="on">自動で揃える</button>
+    <button data-v="off">そのまま置く</button>
+  </div>
+
+  <h2>駒台の位置</h2>
+  <div id="standlayout" class="seg">
+    <button data-v="match" class="on">左上・右下</button>
+    <button data-v="study">右上・右下</button>
+    <button data-v="tall">真上</button>
+  </div>
+
+  <h2>駒箱</h2>
+  <div id="boxmode" class="seg">
+    <button data-v="on" class="on">表示する</button>
+    <button data-v="off">表示しない</button>
+  </div>
+  <div style="margin-top:8px">
+    <button id="btn-spill">駒を盤に出す</button>
+    <button id="btn-boxall">駒箱に全て片付ける</button>
+  </div>
+  <div id="box-note" class="warn" style="margin-top:8px" hidden></div>
+
+  <h2>音量</h2>
+  <div id="params-volume"></div>
+
+  <h2>駒の重なり</h2>
+  <div id="overlap" class="seg">
+    <button data-v="off" class="on">不可能</button>
+    <button data-v="on">可能</button>
+  </div>
+
+  <h2>符号</h2>
+  <div id="coords" class="seg">
+    <button data-v="on" class="on">表示する</button>
+    <button data-v="off">表示しない</button>
+  </div>
+
+  <h2>駒台にまとめられた駒の取っ手</h2>
+  <div id="standhandles" class="seg">
+    <button data-v="on" class="on">表示する</button>
+    <button data-v="off">表示しない</button>
+  </div>
+
+  <h2>最終手ハイライト</h2>
+  <div id="lastmove" class="seg">
+    <button data-v="on">表示する</button>
+    <button data-v="off" class="on">表示しない</button>
+  </div>
+
+  <h2>吸着</h2>
+  <div id="snapmode" class="seg">
+    <button data-v="on" class="on">ON</button>
+    <button data-v="off">OFF</button>
+  </div>
+  <div class="note" style="margin-top:0">
+    ONにすると、自動で升に収まるようになります。OFFにすると自由に駒を動かせるようになりますが、操作性や動作は悪化します。
+  </div>
+
+  <h2>駒の位置のばらつき</h2>
+  <div id="wobblemode" class="seg">
+    <button data-v="on" class="on">ON</button>
+    <button data-v="off">OFF</button>
+  </div>
+  <div class="note" style="margin-top:0">
+    ONにすると、実物の盤で駒を置いた時と同じように駒を離す位置によって駒の位置が少しズレます。
+    盤面の読み取り範囲より外へは出ず、常にマス目の中に入ります。
+  </div>
+
+  <details id="advanced">
+    <summary>高度な設定</summary>
+
+    <h3>吸着のさじ加減</h3>
+    <div id="params"></div>
+
+    <h3>持ち上げとスライド</h3>
+    <div id="params-hold"></div>
+
+    <h3>盤面の読み取り</h3>
+    <div id="params-read"></div>
+
+    <h3>駒の描画</h3>
+    <div id="params-relief"></div>
+  </details>
+
+  <h2>素材について</h2>
+  <div class="note" style="margin-top:0">
+    駒字の画像は <b>しんえれ外部駒</b>（shineleckoma.web.fc2.com）のものです。
+    <a href="https://creativecommons.org/licenses/by-nc/2.1/jp/" target="_blank" rel="noopener">クリエイティブ・コモンズ
+    表示 - 非営利 2.1 日本</a> ライセンスのもと、非営利で使わせていただいています。
+    木地を透明にして駒字だけを残す改変をしています（木地・木目・光沢はこのソフトで描いています）。
+    駒をぶちまける音は <b>ノタの森</b>（notanomori.net）の音素材で、
+    <a href="https://creativecommons.org/licenses/by/3.0/" target="_blank" rel="noopener">クリエイティブ・コモンズ
+    表示 3.0 非移植</a> ライセンスです。駒台に置く音はこのソフトのために録音したもの、
+    駒音とすべる音は著作権フリーの効果音素材（YouTube・Pixabay）を加工・合成したものです。
+  </div>
+
+  <h2>覚えた設定</h2>
+  <button id="btn-forget">最初の状態に戻す</button>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "./vendor/three.module.js",
+    "cannon-es": "./vendor/cannon-es.js"
+  }
+}
+</script>
+<script type="module" src="./src/main.js"></script>
+</body>
+</html>

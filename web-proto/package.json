@@ -1,0 +1,11 @@
+{
+  "name": "shogi-board-proto",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "vendor/ に置いたライブラリの出どころの記録。npm install は要りません（importmap で vendor/ を直接参照しています）",
+  "dependencies": {
+    "cannon-es": "^0.20.0",
+    "three": "^0.180.0"
+  }
+}

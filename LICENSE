@@ -1,0 +1,99 @@
+MIT License
+
+Copyright (c) 2026 oribaokiba
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+
+================================================================================
+同梱している第三者の素材について / Bundled third-party assets
+================================================================================
+
+■ 駒字の画像 / Piece character images  —  web-proto/img/*.png
+
+  「しんえれ外部駒」（http://shineleckoma.web.fc2.com/）を改変したものです。
+  クリエイティブ・コモンズ 表示 - 非営利 2.1 日本（CC BY-NC 2.1 JP）
+  https://creativecommons.org/licenses/by-nc/2.1/jp/
+
+  **非営利での利用に限られます。** 改変内容などは web-proto/img/CREDITS.txt を
+  読んでください。
+
+  Derived from "Shinelec Gaibu Koma", licensed under CC BY-NC 2.1 JP.
+  **Non-commercial use only.** See web-proto/img/CREDITS.txt for details.
+
+  → したがって、この配布物を**そのまま**利用・再配布する場合は非営利に限られます。
+    **非営利に縛るのはこの画像だけ**で、画像を取り除けば残りはすべて商用でも扱えます
+    （下の効果音は商用可です。ただし wav 単独で配り直せないものがあります）。
+
+    Consequently, redistributing this work **as a whole** is limited to
+    non-commercial use. **These images are the only non-commercial part**;
+    remove them and everything else allows commercial use (see the sound
+    effects below — some may not be redistributed as standalone audio files).
+
+■ 効果音の一部 / Some sound effects  —  web-proto/audio/spill1.wav, spill2.wav
+
+  「ノタの森」（http://notanomori.net/ ）の音素材です。
+  音No.1726 / 音No.1724「将棋の駒をぶちまける音」
+  クリエイティブ・コモンズ 表示 3.0 非移植（CC BY 3.0）
+  https://creativecommons.org/licenses/by/3.0/
+  クレジット： ノタの森 / Nota no Mori
+
+  商用利用も改変もできる条件なので、上の非営利制限には関係しません。
+
+  From "ノタの森 / Nota no Mori" (http://notanomori.net/ ), licensed under
+  CC BY 3.0 Unported. Credit: ノタの森 / Nota no Mori.
+
+  駒台に置く音（place.wav）はこのソフトのために録音したもので、上の MIT ライセンスが
+  適用されます。
+  The sound of placing a piece on the stand (place.wav) was recorded for this
+  software and is MIT-licensed.
+
+■ 効果音の一部 / Some sound effects  —  web-proto/audio/clack1.wav, clack2.wav, slide.wav
+
+  YouTube「著作権フリー効果音ライブラリー」の素材と Pixabay の素材 2 点を加工・合成した
+  ものです。どちらの配布元も無償・商用可・改変可としていますが、**素材そのものを単独で
+  再配布すること**は禁じています。したがってこの 3 本は、
+
+    ・このソフトの一部として利用・再配布する  → できます
+    ・wav ファイルだけを取り出して配布し直す  → できません
+
+  という扱いで、上の MIT ライセンスはこの 3 本には及びません。
+  詳しくは web-proto/audio/CREDITS.txt を読んでください。
+
+  Derived from royalty-free sound library material (YouTube) and two Pixabay
+  sounds, both of which permit free commercial use and modification but forbid
+  redistributing the source material on its own. These three files may therefore
+  be redistributed **as part of this software only**, not as standalone audio
+  files. The MIT license above does not cover them.
+
+■ ライブラリ / Libraries  —  web-proto/vendor/
+
+  three.js          MIT   web-proto/vendor/LICENSE.three
+  cannon-es         MIT   web-proto/vendor/LICENSE.cannon-es
+  coi-serviceworker MIT   web-proto/coi-serviceworker.LICENSE.txt
+
+■ 同梱していないもの / Not bundled
+
+  USI エンジン（YaneuraOu.wasm）は GPLv3 のため同梱していません。
+  上の CC BY-NC（非営利限定）は GPLv3 が禁じる「追加の制限」にあたり、両立しません。
+  使い方は README.md を読んでください。
+
+  The USI engine (YaneuraOu.wasm) is GPLv3 and is NOT bundled, because the
+  non-commercial restriction above is a "further restriction" that GPLv3
+  forbids. See README.md if you want to use it.
