@@ -55,6 +55,7 @@
     font: inherit; font-size: 13px; color: #c4bcb0; white-space: nowrap;
     background: transparent; border: 0; border-radius: 7px; }
   #topbar button.on { background: #c9a35e; color: #221c14; font-weight: 700; }
+  #topbar button:disabled { opacity: .35; cursor: default; }
   #topbar .ic { font-size: 15px; margin-right: 4px; }
 
   /* 視点のプリセット。**「視点」モードのときだけ出す**（駒モードでは視点が動かないので、
@@ -216,6 +217,43 @@
     border: 1px solid rgba(255,255,255,.16); border-radius: 6px; }
   .btns button:hover { background: #3f372e; }
 
+  /* 短い知らせ。topbar のすぐ下に出す。 */
+  /* **`left: 50%` + `translateX(-50%)` にしない。** fixed 要素の幅は包含ブロックの
+     左端（＝画面の中央）から測るので、使える幅が半分になって早々に折り返す
+     （375px の画面で 188px しか取れなかった）。左右を留めて margin で中央へ寄せる。 */
+  #toast { position: fixed; z-index: 7; left: 12px; right: 12px;
+    width: fit-content; margin-inline: auto;
+    top: calc(var(--sat) + 68px); max-width: min(420px, calc(100% - 24px));
+    padding: 10px 16px; text-align: center; line-height: 1.5;
+    background: rgba(24,21,18,.86); backdrop-filter: blur(8px);
+    border: 1px solid rgba(255,255,255,.14); border-radius: 10px;
+    color: #e8e2d8; font-size: 14px; }
+  #toast[hidden] { display: none; }
+
+  /* 効果音の差し替え。1 行に「名前・いまの状態・選ぶ・戻す」。 */
+  .sndrow { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; }
+  .sndrow .lb { flex: 1; min-width: 0; font-size: 13px; color: #c4bcb0; }
+  .sndrow .st { font-size: 11px; color: #8d857a; white-space: nowrap; }
+  .sndrow button { padding: 6px 10px; cursor: pointer; font: inherit; font-size: 12px;
+    background: #2a2521; color: #c4bcb0;
+    border: 1px solid rgba(255,255,255,.14); border-radius: 6px; }
+  .sndrow button:hover:not(:disabled) { background: #3f372e; }
+  .sndrow button:disabled { opacity: .35; cursor: default; }
+
+  /* SFEN の受け渡し欄。長い一行なので折り返して見せる。 */
+  #sfen { width: 100%; box-sizing: border-box; resize: vertical;
+    padding: 8px 10px; font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    background: #211d1a; color: #d8d0c4; word-break: break-all;
+    border: 1px solid rgba(255,255,255,.14); border-radius: 6px; }
+  #sfen::placeholder { color: #6d655c; }
+
+  /* 手合い割。10 個あるので折り返す（狭い画面では 3 行前後になる）。 */
+  #handicaps { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 14px; }
+  #handicaps button { flex: 1 0 auto; min-width: 74px; padding: 8px 10px; cursor: pointer;
+    font: inherit; background: #2a2521; color: #c4bcb0;
+    border: 1px solid rgba(255,255,255,.14); border-radius: 6px; }
+  #handicaps button:hover { background: #3f372e; }
+
   /* --- 狭い画面 -----------------------------------------------------------
      **スマホは作り込まない方針だが、はみ出したままは危ない**。
      実測（375px 幅）で上部の 5 つが 379px、視点のプリセットが 401px 要って
@@ -241,9 +279,15 @@
 <body>
 <div id="app"></div>
 
+<!-- 短い知らせ（振り駒の結果、読み込みの失敗など）。
+     **盤を見ながら読むものなので幕は張らない。** 数秒で消える。 -->
+<div id="toast" hidden></div>
+
 <div id="topbar">
   <button data-mode="piece" class="on"><span class="ic">☗</span>駒</button>
   <button data-mode="camera"><span class="ic">🎥</span>視点</button>
+  <!-- 誤操作の救済。押せるかどうかが見えるよう、戻る先が無ければ disabled にする。 -->
+  <button id="btn-undo" disabled title="ひとつ前の配置へ戻す"><span class="ic">↩</span>戻す</button>
   <button id="btn-marks"><span class="ic">🔖</span>栞</button>
   <button id="btn-analysis"><span class="ic">🔍</span>解析</button>
   <button id="btn-settings"><span class="ic">⚙</span>設定</button>
@@ -260,6 +304,11 @@
   <button data-zoom="far">遠</button>
   <span class="lb">向き</span>
   <button id="btn-square" title="盤の辺を画面と平行にする">正面</button>
+  <!-- **画像の保存はここに置く。** 撮る前に視点を決めるものなので、
+       視点のプリセットと同じ並びにある方が流れに合う。
+       中身は栞の絵と同じ仕組みで、画面の縦横比のまま長辺 1920px の PNG で落とす。 -->
+  <span class="lb">保存</span>
+  <button id="btn-shot" title="いま見えている盤面を画像で保存する">画像</button>
 </div>
 
 <!-- 中の駒の絵は選んだ駒に応じて main.js が描く（drawKomaIcon）。
@@ -336,7 +385,45 @@
 
   <div class="btns">
     <button id="btn-tidy">整列</button>
-    <button id="btn-reset">初期配置</button>
+  </div>
+
+  <h2>初期配置</h2>
+  <!-- 手合い割。落とすのは**上手（後手）の駒**で、外した駒は駒箱へ入る
+       （駒箱がしまってあれば setupPosition が開く）。
+       **選択状態ではなく「押したら並ぶ」操作**なので、セグメント（.seg）にはしない
+       — 並べたあと駒を1枚でも動かせばその手合いから外れる。 -->
+  <div id="handicaps">
+    <button data-h="hirate">平手</button>
+    <button data-h="kyo">香落ち</button>
+    <button data-h="kaku">角落ち</button>
+    <button data-h="hisha">飛車落ち</button>
+    <button data-h="hikyo">飛香落ち</button>
+    <button data-h="2">二枚落ち</button>
+    <button data-h="4">四枚落ち</button>
+    <button data-h="6">六枚落ち</button>
+    <button data-h="8">八枚落ち</button>
+    <button data-h="10">十枚落ち</button>
+  </div>
+
+  <!-- 振り駒。歩を駒箱から取り、足りなければ盤の歩を借りる。
+       結果は数えて見せるだけで、手番までは決めない。 -->
+  <div class="btns">
+    <button id="btn-furigoma">振り駒</button>
+  </div>
+
+  <h2>局面の受け渡し（SFEN）</h2>
+  <!-- **局面ひとつだけ。棋譜は扱わない。** 読み込んだらそこで終わりで、あとは手で触る。
+       駒箱の駒は局面に数えないので、駒落ちがそのまま出入りする。
+       手番は解析パネルの「手番」と同じものを使う。 -->
+  <textarea id="sfen" rows="3" spellcheck="false" autocapitalize="off" autocomplete="off"
+    placeholder="lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1"></textarea>
+  <div class="btns" style="margin-top:8px">
+    <button id="btn-sfen-load">読み込む</button>
+    <button id="btn-sfen-dump">いまの局面を出す</button>
+    <button id="btn-sfen-url">リンクを作る</button>
+  </div>
+  <div class="note" style="margin-top:6px">
+    「リンクを作る」で作った URL を開くと、その局面から始められます。
   </div>
 
   <div class="keys">
@@ -417,6 +504,16 @@
 
   <h2>音量</h2>
   <div id="params-volume"></div>
+
+  <h2>効果音の差し替え</h2>
+  <!-- 実物の盤を持っている人が自分の駒音で遊べるように。
+       置き場所は IndexedDB（localStorage には wav が入らない）。
+       1 種類に何本入れてもよく、鳴るたびにその中から選ばれる。 -->
+  <div class="note" style="margin-top:0">
+    自分で録った音に替えられます。選んだ音は<b>この端末に残ります</b>。
+    1 つの音に何本か選ぶと、鳴るたびにその中から選ばれます。
+  </div>
+  <div id="sounds"></div>
 
   <h2>駒の重なり</h2>
   <div id="overlap" class="seg">

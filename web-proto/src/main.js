@@ -16,8 +16,11 @@ import {
 } from "./board.js";
 import {
   initAudio, resumeAudio, playClack, playClick, playSlide, playPlace, playSpill, setMasterVolume,
+  setSound, isCustomSound,
 } from "./sound.js";
-import { toSfen, checkPosition, parseMove, pvText, scoreText, loadEngine, engineLoaded } from "./usi.js";
+import {
+  toSfen, fromSfen, checkPosition, parseMove, pvText, scoreText, loadEngine, engineLoaded,
+} from "./usi.js";
 
 // --- 調整パラメータ -----------------------------------------------------
 const P = {
@@ -454,15 +457,183 @@ function setPiecePose(piece, x, y, z, yaw, flipped = false) {
   renderer.shadowMap.needsUpdate = true;
 }
 
-/** 平手の初期配置に一括で並べる。 */
-function resetHirate() {
+// --- 盤面をまるごと控える／戻す -----------------------------------------
+//
+// 栞と「元に戻す」が共有する土台。どちらも**盤面（readBoard）ではなく駒の姿勢を
+// そのまま覚える**。読み取りは升に収まった駒しか見ないので、崩れた盤面も
+// 駒台の並びも復元できない。
+//
+// **使う側（setupPosition）より前に置いてある。** 中の `undoStack` は const なので、
+// 起動時の `resetHirate()` がここより先に走ると初期化前に触ることになる。
+
+/**
+ * 全駒の姿勢を控える。
+ *
+ * **収まりかけの駒は行き先（settle.to / toQ）を覚える。** 途中の姿勢を覚えると、
+ * 戻したときに升の手前で止まった中途半端な配置になる。
+ */
+function capturePoses() {
+  return pieces.map((p) => ({
+    p,
+    x: p.settle ? p.settle.to.x : p.body.position.x,
+    y: p.settle ? p.settle.to.y : p.body.position.y,
+    z: p.settle ? p.settle.to.z : p.body.position.z,
+    q: (p.settle ? p.settle.toQ : p.mesh.quaternion).clone(),
+  }));
+}
+
+/**
+ * 控えた姿勢へ一斉に戻す。**瞬間で戻す。音も動きもない。**
+ *
+ * 盤面がまるごと入れ替わるので、最終手ハイライトと最善手の矢印は捨てる
+ * （resetHirate と同じ扱い。戻すのは指し手ではない）。
+ */
+function applyPoses(poses) {
+  if (grab.piece) endGrab();
+  if (chainGrab.list) endChainGrab();
+  clearSelection();
+  for (const s of poses) {
+    const b = s.p.body;
+    s.p.settle = null;
+    // 駒台の持ち駒と駒箱の駒は静止物に戻す（重ねると箱どうしが重なるため）。
+    const at = placeAt(s.x, s.z);
+    const onStand = !!at && at.stacks;
+    b.type = onStand ? CANNON.Body.STATIC : CANNON.Body.DYNAMIC;
+    b.updateMassProperties();
+    b.collisionResponse = true;
+    b.position.set(s.x, s.y, s.z);
+    b.quaternion.set(s.q.x, s.q.y, s.q.z, s.q.w);
+    b.velocity.setZero();
+    b.angularVelocity.setZero();
+    s.p.mesh.position.copy(b.position);
+    s.p.mesh.quaternion.copy(b.quaternion);
+    if (!onStand) b.sleep();
+  }
+  lastMove = null;
+  prevBoard = null;
+  clearArrow();
+  // ここでメッシュまで直接動かすので tick の比較には出ない。明示的に立てる。
+  renderer.shadowMap.needsUpdate = true;
+}
+
+// --- 元に戻す -----------------------------------------------------------
+//
+// 物理サンドボックスは誤操作が起きやすい（払って駒が飛ぶ、置く場所を間違える、
+// 塊ごと動かしてしまう）ので、ひとつ前の配置へ戻る口を用意する。
+//
+// - **絵は持たない。** 一覧しないので姿勢だけでよい（栞は名前が無いぶん絵で見分ける）
+// - **積むのは操作の入口。** 掴む・状態を進める・並べ直す・ぶちまける・片付ける
+// - **戻すときに「いまと同じ段」は読み飛ばす。** ちょんと触って離しただけ
+//   （＝駒のボタンを出しただけ）でも入口は通るので、そのままだと押しても何も
+//   変わらない段が挟まる。**積む側で判じるより、戻す側で飛ばすほうが漏れない**
+//   （入口では「これから変わるか」がまだ分からない）
+// - **Redo は作らない。** 実物の盤に無いし、戻しすぎたら栞で拾える
+
+const UNDO_MAX = 50;
+const undoStack = [];
+const undoBtn = document.getElementById("btn-undo");
+
+/**
+ * 同じ配置か。**物理の微動で「違う」と読まれないよう、駒 1 枚分よりずっと粗く見る。**
+ * 駒を動かせば必ず 1cm 以上動くので、0.05cm を境にしても取りこぼさない。
+ */
+function posesEqual(a, b) {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    const s = a[i], t = b[i];
+    if (s.p !== t.p) return false;
+    if (Math.abs(s.x - t.x) > 0.05) return false;
+    if (Math.abs(s.y - t.y) > 0.05) return false;
+    if (Math.abs(s.z - t.z) > 0.05) return false;
+    // 四元数は符号を反転しても同じ姿勢なので、内積の絶対値で見る
+    if (Math.abs(s.q.dot(t.q)) < 0.9995) return false;
+  }
+  return true;
+}
+
+function refreshUndo() {
+  if (undoBtn) undoBtn.disabled = !undoStack.length;
+}
+
+/** これから盤面が変わる、という所で呼ぶ。 */
+function pushUndo() {
+  undoStack.push(capturePoses());
+  if (undoStack.length > UNDO_MAX) undoStack.shift();
+  refreshUndo();
+}
+
+/** ひとつ前の配置へ戻す。戻る先が無ければ false。 */
+function undo() {
+  const now = capturePoses();
+  let ok = false;
+  while (undoStack.length) {
+    const poses = undoStack.pop();
+    if (posesEqual(poses, now)) continue; // 何も変わらない段は飛ばす
+    applyPoses(poses);
+    ok = true;
+    break;
+  }
+  refreshUndo();
+  return ok;
+}
+
+undoBtn?.addEventListener("click", () => undo());
+
+/**
+ * 升の並びを一括で置く。**平手も駒落ちも SFEN の読み込みもここを通る。**
+ *
+ * `list` は `[kindId, file, rank, yaw, flipped]`。うしろ 2 つは省いてよく、
+ * `yaw` を省くと**段 1-3 を後手**として向きを決める（平手と駒落ちはこれで足りる。
+ * SFEN は駒ごとに先後が決まるので明示して渡す）。
+ *
+ * **駒の順番は問わない。** 駒種ごとのプールから配るので、同じ種類ならどれでもよい。
+ * **リストに入らなかった駒は駒箱へ送る**（駒落ちで外した駒の置き場所）。送る駒が
+ * あるのに駒箱がしまってあれば開くが、**設定のボタンを押す経路を通す**
+ * （`ensureFit` と物理の実体の出し入れがぶら下がっているので、`KOMABAKO.visible` を
+ * 直接触ると必ずどれか忘れる）。
+ */
+function setupPosition(list, hands = null) {
+  pushUndo();
   grab.piece = null;
-  HIRATE.forEach(([kindId, file, rank], i) => {
-    const piece = pieces[i];
+  // 駒種ごとのプール。pieces は HIRATE の順に作ってあるので、種類さえ合えばどれでもよい。
+  const pool = new Map();
+  for (const p of pieces) {
+    if (!pool.has(p.kindId)) pool.set(p.kindId, []);
+    pool.get(p.kindId).push(p);
+  }
+  // **配る前に全部いったん退ける。** 前の局面の持ち駒が駒台に残っていると、
+  // 下の `sendToStand` がそれを既存の駒として拾って寄り添い、あとでその駒が
+  // 駒箱へ移って扇が歯抜けになる。同期処理なので画面には出ない。
+  for (const p of pieces) {
+    p.settle = null;
+    p.body.position.set(0, -100, 0);
+    p.mesh.position.copy(p.body.position);
+  }
+  for (const [kindId, file, rank, yaw, flipped = false] of list) {
+    const piece = pool.get(kindId)?.pop();
+    if (!piece) continue; // 駒が足りない並びは黙って落とす（数の検査は呼ぶ側の仕事）
     const c = squareToWorld(file, rank);
-    // 段1-3が後手。先端を手前に向ける。
-    setPiecePose(piece, c.x, TOP_Y + piece.size.t / 2, c.z, rank <= 3 ? Math.PI : 0);
-  });
+    setPiecePose(piece, c.x, TOP_Y + piece.size.t / 2, c.z,
+      yaw === undefined ? (rank <= 3 ? Math.PI : 0) : yaw, flipped);
+  }
+  // 持ち駒。**駒台へは `sendToStand` で置く**ので扇の並びが自動で組まれる。
+  // **1 枚ごとに行き先を確定させる**（そうしないと次の駒が動く前の位置を見て扇が崩れる）。
+  // 音は鳴らさない（並べ直しは指し手ではない。枚数ぶん鳴れば連打にもなる）。
+  if (hands) {
+    for (const owner of [0, 1]) {
+      for (const kindId of hands[owner]) {
+        const piece = pool.get(kindId)?.pop();
+        if (!piece) continue;
+        sendToStand(piece, owner, null);
+        flushSettles();
+      }
+    }
+  }
+  const rest = [...pool.values()].flat();
+  if (rest.length) {
+    if (!KOMABAKO.visible) setSegment("boxmode", "on");
+    putIntoBox(rest);
+  }
   marker.visible = false;
   clearSelection();
   // 並べ直しは指し手ではない。差分として拾わせない。
@@ -470,6 +641,36 @@ function resetHirate() {
   prevBoard = null;
   // 解析した局面ごと消えるので、最善手の矢印も捨てる。
   clearArrow();
+}
+
+/** 平手の初期配置に一括で並べる。 */
+function resetHirate() {
+  setupPosition(HIRATE);
+}
+
+/**
+ * 手合い割。**落とすのは上手（後手）の駒**なので、外す升はすべて段 1〜2 にある。
+ *
+ * 香落ちは**左香**（上手から見て左＝1筋）。四枚から下は落とす駒が増えていくだけで、
+ * 上位の手合いは下位を含む。外した駒は `setupPosition` が駒箱へ送る。
+ */
+const HANDICAPS = {
+  hirate: [],
+  kyo:    [[1, 1]],
+  kaku:   [[2, 2]],
+  hisha:  [[8, 2]],
+  hikyo:  [[8, 2], [1, 1]],
+  "2":    [[8, 2], [2, 2]],
+  "4":    [[8, 2], [2, 2], [1, 1], [9, 1]],
+  "6":    [[8, 2], [2, 2], [1, 1], [9, 1], [2, 1], [8, 1]],
+  "8":    [[8, 2], [2, 2], [1, 1], [9, 1], [2, 1], [8, 1], [3, 1], [7, 1]],
+  "10":   [[8, 2], [2, 2], [1, 1], [9, 1], [2, 1], [8, 1], [3, 1], [7, 1], [4, 1], [6, 1]],
+};
+
+function setupHandicap(name) {
+  const drop = HANDICAPS[name];
+  if (!drop) return;
+  setupPosition(HIRATE.filter(([, f, r]) => !drop.some(([df, dr]) => df === f && dr === r)));
 }
 
 function applyStyle() {
@@ -632,19 +833,22 @@ function stackSpotAt(x, z) {
  *
  * そこに収まった駒は STATIC なので物理では支えられない。ここで高さを決めないと、
  * 何枚重ねても同じ座標に居座る（物理的にありえない）。
- * **肩を接した隣は数えない。** 上の `STACK_R` を読む。
+ *
+ * **下にいるかどうかは輪郭が重なるかで見る**（`pieceOutline`）。中心どうしの近さで
+ * 見ていたのは、実寸の箱では扇の隣まで重なって数えてしまうためだったが、
+ * 五角形で見れば寄り添った隣は重ならないので、その妥協が要らない。
+ * おかげで**押し出しきれずに重なった駒はきちんと上に乗る**（詰まった駒箱で効く）。
  */
-function stackSurfaceY(piece, x, z, ignore) {
+function stackSurfaceY(piece, x, z, ignore, yaw = null) {
   const here = stackSpotAt(x, z);
   let top = here ? here.topY : STAND.topY;
-  const r = here ? here.stackR : STACK_R;
+  const my = pieceOutline(piece, x, z, yaw === null ? yawOf(piece.mesh.quaternion) : yaw);
   for (const p of pieces) {
     if (p === piece || p === ignore || p === grab.piece) continue;
     const pp = p.body.position;
     if (!stackSpotAt(pp.x, pp.z)) continue; // 盤や床の駒は関係ない
-    if (Math.hypot(pp.x - x, pp.z - z) < (piece.size.w + p.size.w) * r) {
-      top = Math.max(top, pp.y + p.size.t / 2);
-    }
+    const hit = outlineSeparation(my, pieceOutline(p, pp.x, pp.z, yawOf(p.mesh.quaternion)));
+    if (hit) top = Math.max(top, pp.y + p.size.t / 2);
   }
   return top + piece.size.t / 2;
 }
@@ -659,11 +863,13 @@ function stackSurfaceY(piece, x, z, ignore) {
 function restackAt(x, z, removed) {
   const here = stackSpotAt(x, z);
   if (!here) return;
+  // 抜けた駒の場所と輪郭が重なる駒＝その山にいた駒（`stackSurfaceY` と同じ見方）
+  const gone = pieceOutline(removed, x, z, yawOf(removed.mesh.quaternion));
   const list = pieces.filter((q) => {
     if (q === removed || q === grab.piece) return false;
     const qq = q.body.position;
     if (!stackSpotAt(qq.x, qq.z)) return false;
-    return Math.hypot(qq.x - x, qq.z - z) < (removed.size.w + q.size.w) * here.stackR;
+    return !!outlineSeparation(gone, pieceOutline(q, qq.x, qq.z, yawOf(q.mesh.quaternion)));
   }).sort((a, b) => a.body.position.y - b.body.position.y);
 
   let top = here.topY;
@@ -814,6 +1020,116 @@ function insideStand(stand, x, z) {
 }
 
 /**
+ * 駒が水平面で占める五角形。**実寸の箱ではなく実際の形で見る。**
+ *
+ * 扇は五角形の角どうしを接するので、**箱で見ると寄り添っただけの隣まで
+ * 「重なっている」と読んでしまう**（そのために `STACK_R` を駒幅の半分以下まで
+ * 絞ってあった）。実測すると、寄り添った扇は歩 5 枚でも 7 種混在でも
+ * 五角形としては**一切重ならない**ので、形で見れば妥協が要らない。
+ *
+ * ジオメトリは `rotateX(-90°)` 済みで、**形状の +y（先端）はローカル -z を向く**。
+ */
+function pieceOutline(piece, x, z, yaw) {
+  const s = piece.size, hw = s.w / 2, hl = s.l / 2;
+  const sh = shoulderOf(s);
+  const c = Math.cos(yaw), sn = Math.sin(yaw);
+  return [[0, hl], [-sh.sx, sh.sy], [-hw, -hl], [hw, -hl], [sh.sx, sh.sy]]
+    .map(([lx, ly]) => {
+      const pz = -ly;
+      return [x + lx * c + pz * sn, z - lx * sn + pz * c];
+    });
+}
+
+/**
+ * 2 つの輪郭が重なっていれば、A を離す向きと深さ（分離軸定理）。離れていれば null。
+ * どちらも凸なので、辺の法線だけ調べれば足りる。
+ */
+function outlineSeparation(A, B) {
+  let best = null;
+  for (const poly of [A, B]) {
+    for (let i = 0; i < poly.length; i++) {
+      const [x1, y1] = poly[i], [x2, y2] = poly[(i + 1) % poly.length];
+      let ax = -(y2 - y1), ay = x2 - x1;
+      const len = Math.hypot(ax, ay) || 1;
+      ax /= len; ay /= len;
+      let mnA = Infinity, mxA = -Infinity, mnB = Infinity, mxB = -Infinity;
+      for (const [x, y] of A) { const d = x * ax + y * ay; if (d < mnA) mnA = d; if (d > mxA) mxA = d; }
+      for (const [x, y] of B) { const d = x * ax + y * ay; if (d < mnB) mnB = d; if (d > mxB) mxB = d; }
+      const o = Math.min(mxA, mxB) - Math.max(mnA, mnB);
+      if (o <= 0) return null; // 分離軸が見つかった＝離れている
+      if (!best || o < best.depth) {
+        const dir = mnA + mxA < mnB + mxB ? -1 : 1; // A を B から遠ざける向き
+        best = { depth: o, x: ax * dir, z: ay * dir };
+      }
+    }
+  }
+  return best;
+}
+
+/**
+ * 置こうとした場所で他の駒と重なっていたら、重ならない所まで押し出す。
+ *
+ * **段を上げるのは「ほぼ真上に置いた」ときだけ**（`spot.stackR` の内側）。
+ * 横からぶつかっただけなら、**押し出すほうが物として自然**
+ * （高さで逃がすと、塊の端だけが乗ったときに反対側が宙に浮く）。
+ *
+ * 1 回で解けないことがあるので何度か繰り返す。深いものから順に解く。
+ */
+function pushOutOfPieces(piece, x, z, yaw, others, stackR) {
+  let px = x, pz = z;
+  for (let iter = 0; iter < 12; iter++) {
+    const poly = pieceOutline(piece, px, pz, yaw);
+    let hit = null;
+    for (const q of others) {
+      const qp = q.body.position;
+      // ほぼ真上なら「上に乗せた」。押し出さず段に任せる。
+      // **`stackSurfaceY` と同じ基準**（駒幅の和に掛ける）。駒箱は寄り添いが無いぶん
+      // 広く（歩どうし 1.98cm）、駒台は扇を優先して狭く（同 0.88cm）取る。
+      if (Math.hypot(qp.x - px, qp.z - pz) < (piece.size.w + q.size.w) * stackR) continue;
+      const sep = outlineSeparation(poly, pieceOutline(q, qp.x, qp.z, yawOf(q.mesh.quaternion)));
+      if (sep && (!hit || sep.depth > hit.depth)) hit = sep;
+    }
+    if (!hit) break;
+    px += hit.x * (hit.depth + 0.02);
+    pz += hit.z * (hit.depth + 0.02);
+  }
+  return { x: px, z: pz };
+}
+
+/**
+ * 入れ物（駒台・駒箱）の内側に駒を収める。
+ *
+ * **駒の中心ではなく、駒が実際に占める広がりで見る。** 場所の判定（`nearestBox` /
+ * `insideStand`）はどれも中心座標しか見ていないので、そのまま置くと**駒の半分が
+ * 壁にめり込む**。駒箱は壁があるぶん目に見えて分かる（歩でも 1cm 以上刺さる）。
+ *
+ * 向きによって占める広がりが変わるので、回した矩形の外接で測る。
+ */
+function fitInside(spot, piece, x, z, yaw) {
+  let cx, cz, hw, hd;
+  if (spot.kind === "box") {
+    cx = KOMABAKO.x; cz = KOMABAKO.z;
+    hw = BOX.w / 2 - BOX.wall;  // 壁の内面まで
+    hd = BOX.d / 2 - BOX.wall;
+  } else if (spot.kind === "stand") {
+    cx = spot.stand.x; cz = spot.stand.z;
+    // 際ぴったりに寄せない。誤差で「駒台の外」と読まれて寄り添い先から外れる。
+    hw = STAND_INNER.w / 2 - 0.05;
+    hd = STAND_INNER.d / 2 - 0.05;
+  } else {
+    return { x, z };
+  }
+  const c = Math.abs(Math.cos(yaw)), s = Math.abs(Math.sin(yaw));
+  const pw = (piece.size.w * c + piece.size.l * s) / 2;
+  const pd = (piece.size.w * s + piece.size.l * c) / 2;
+  const limX = Math.max(0, hw - pw), limZ = Math.max(0, hd - pd);
+  return {
+    x: cx + Math.max(-limX, Math.min(limX, x - cx)),
+    z: cz + Math.max(-limZ, Math.min(limZ, z - cz)),
+  };
+}
+
+/**
  * 駒台に置くときの落とし所。
  * 隣の駒の肩の近くで手を離せばそこに寄り添い、離れた所で離せばそのまま置かれる。
  * 並べ方に決まりはないので、勝手に整列させない。
@@ -863,13 +1179,26 @@ function angleDiff(a, b) {
 }
 
 /** b が a の肩に寄り添っているか。a から見て右なら +1、左なら -1、離れていれば 0。 */
+/**
+ * 塊を判じるときの駒の姿勢。**収まりかけの駒は行き先を見る**
+ * （`capturePoses` と同じ考え方）。
+ *
+ * 途中の姿勢で見ると、**まだ動いている駒だけ肩がつながっていないと読まれ、
+ * そこで塊が割れる**。続けて駒を摘まむと前の駒が収まりきる前に次の判定が走るので、
+ * 実際に起きる。
+ */
+function standPose(p) {
+  return p.settle
+    ? { x: p.settle.to.x, z: p.settle.to.z, yaw: yawOf(p.settle.toQ) }
+    : { x: p.body.position.x, z: p.body.position.z, yaw: yawOf(p.mesh.quaternion) };
+}
+
 function attachedSide(a, b) {
-  const ay = yawOf(a.mesh.quaternion);
-  const by = yawOf(b.mesh.quaternion);
+  const ap = standPose(a), bp = standPose(b);
   for (const side of [1, -1]) {
-    const pose = attachPose(a.body.position.x, a.body.position.z, ay, a.size, b, side);
-    if (Math.hypot(pose.x - b.body.position.x, pose.z - b.body.position.z) > ATTACH_TOL) continue;
-    if (Math.abs(angleDiff(pose.yaw, by)) > ATTACH_TOL_YAW) continue;
+    const pose = attachPose(ap.x, ap.z, ap.yaw, a.size, b, side);
+    if (Math.hypot(pose.x - bp.x, pose.z - bp.z) > ATTACH_TOL) continue;
+    if (Math.abs(angleDiff(pose.yaw, bp.yaw)) > ATTACH_TOL_YAW) continue;
     return side;
   }
   return 0;
@@ -881,7 +1210,9 @@ function attachedSide(a, b) {
  * 記録方式にすると、掴んだ・打った・押されてズレた、をいちいち無効化して回る必要がある。
  */
 function chainsOnStand(stand) {
-  const list = piecesOnStand(stand).filter((p) => !p.settle && p !== grab.piece);
+  // **収まりかけの駒も数える**（`standPose` が行き先を見る）。除いてしまうと、
+  // 続けて駒を摘まんだとき前の駒が抜けた形になり、そこで塊が割れる。
+  const list = piecesOnStand(stand).filter((p) => p !== grab.piece);
   const right = new Map(), left = new Map();
   for (const a of list) {
     for (const b of list) {
@@ -1001,6 +1332,7 @@ function refreshHandles() {
 function beginChainGrab(handle, point) {
   const list = handle.userData.chain;
   if (!list) return;
+  pushUndo();
   chainGrab.list = list;
   chainGrab.stand = handle.userData.stand;
   chainGrab.handle = handle;
@@ -1114,7 +1446,12 @@ function anchorFor(list, added) {
  */
 function chainWith(stand, base, side, piece) {
   const chain = chainsOnStand(stand).find((c) => c.includes(base)) || [base];
-  const list = [...chain];
+  // **置こうとしている駒が塊に残っていることがある。** `chainsOnStand` は
+  // `grab.piece` を塊から外すが、`endGrab` は先頭で `grab.piece = null` にするので
+  // そこを通ったときは除外が効かない。取り除かずに差し込むと**同じ駒が二重に入り**、
+  // 1 枚多い扇として角度が割り振られて**塊が割れる**
+  // （歩 5 枚の端を摘まみ直すと ±37.1° の扇が ±46.4°＝6 枚分に広がっていた）。
+  const list = chain.filter((p) => p !== piece);
   const i = list.indexOf(base);
   list.splice(side > 0 ? i + 1 : i, 0, piece);
   return { list, anchor: anchorFor(list, piece) };
@@ -1170,6 +1507,36 @@ function endChainGrab() {
   if (fit.dx || fit.dz) {
     moveChainTo(chainGrab.handle.position.x + fit.dx, chainGrab.handle.position.z + fit.dz);
   }
+
+  // **塊の外の駒と重なっていたら、塊ごと押し出す。**
+  // 高さで逃がすと、端の 1 枚だけが乗ったときに反対側が宙に浮く。
+  // 塊は平行移動だけなので、並びも高さも崩れない。
+  const outside = piecesOnStand(stand).filter((p) => !list.includes(p));
+  if (outside.length) {
+    for (let iter = 0; iter < 12; iter++) {
+      let hit = null;
+      for (const p of list) {
+        const pp = p.body.position;
+        const poly = pieceOutline(p, pp.x, pp.z, yawOf(p.mesh.quaternion));
+        for (const q of outside) {
+          const qp = q.body.position;
+          const sep = outlineSeparation(poly,
+            pieceOutline(q, qp.x, qp.z, yawOf(q.mesh.quaternion)));
+          if (sep && (!hit || sep.depth > hit.depth)) hit = sep;
+        }
+      }
+      if (!hit) break;
+      moveChainTo(
+        chainGrab.handle.position.x + hit.x * (hit.depth + 0.02),
+        chainGrab.handle.position.z + hit.z * (hit.depth + 0.02));
+      // 押し出した先が駒台から出たら戻す（出たまま置かない）
+      const back = fitIntoStand(list, stand);
+      if (back.dx || back.dz) {
+        moveChainTo(chainGrab.handle.position.x + back.dx, chainGrab.handle.position.z + back.dz);
+        break; // 壁と駒に挟まれた。これ以上は動かせない
+      }
+    }
+  }
   // 別の駒の肩に届いていれば繋げる。すべらせただけなら音は鳴らさない。
   const join = chainJoin(list, stand);
   if (join) joinChain(list, join, stand);
@@ -1182,8 +1549,43 @@ function endChainGrab() {
   refreshHandles();
 }
 
-/** 取った駒を持ち主の駒台へ送る。空いている所を探して置く。 */
-function sendToStand(piece, owner) {
+/**
+ * 収まりかけの駒を、アニメーションを待たずに行き先へ置いてしまう。
+ *
+ * **瞬間で並べる経路（SFEN の読み込み）のためのもの。** tick の収まり処理と同じことを
+ * するが、音は鳴らさない。駒台と駒箱の駒を静止物に戻すのも忘れない
+ * （そこを落とすと持ち駒が物理で押し合う）。
+ */
+function flushSettles() {
+  let moved = false;
+  for (const piece of pieces) {
+    const s = piece.settle;
+    if (!s) continue;
+    piece.settle = null;
+    moved = true;
+    const b = piece.body;
+    b.position.set(s.to.x, s.to.y, s.to.z);
+    b.quaternion.set(s.toQ.x, s.toQ.y, s.toQ.z, s.toQ.w);
+    const here = placeAt(b.position.x, b.position.z);
+    const onStand = !!here && here.stacks;
+    b.type = onStand ? CANNON.Body.STATIC : CANNON.Body.DYNAMIC;
+    b.updateMassProperties();
+    b.collisionResponse = true;
+    b.velocity.setZero();
+    b.angularVelocity.setZero();
+    if (!onStand) b.sleep();
+    piece.mesh.position.copy(b.position);
+    piece.mesh.quaternion.copy(b.quaternion);
+  }
+  // ここでメッシュまで直接動かすので tick の比較には出ない。
+  if (moved) renderer.shadowMap.needsUpdate = true;
+}
+
+/**
+ * 取った駒を持ち主の駒台へ送る。空いている所を探して置く。
+ * `sound` を null にすると無音（並べ直しのように、指し手でないときに使う）。
+ */
+function sendToStand(piece, owner, sound = "place") {
   const stand = STANDS.find((s) => s.owner === owner) || STANDS[0];
   const baseYaw = stand.owner === 1 ? Math.PI : 0;
   const here = piecesOnStand(stand).filter((p) => p !== piece);
@@ -1203,7 +1605,7 @@ function sendToStand(piece, owner) {
         startSettle(m.p,
           new THREE.Vector3(m.x, STAND.topY + m.p.size.t / 2, m.z),
           flatQuaternion(m.yaw, isFlipped(m.p.mesh.quaternion)),
-          m.p === piece ? "place" : null);
+          m.p === piece ? sound : null);
       }
       return;
     }
@@ -1213,8 +1615,8 @@ function sendToStand(piece, owner) {
   const flip = stand.owner === 1 ? -1 : 1;
   const hx = stand.x - 3.2 * flip, hz = stand.z + 3.6 * flip;
   startSettle(piece,
-    new THREE.Vector3(hx, stackSurfaceY(piece, hx, hz, null), hz),
-    flatQuaternion(baseYaw, false), "place");
+    new THREE.Vector3(hx, stackSurfaceY(piece, hx, hz, null, baseYaw), hz),
+    flatQuaternion(baseYaw, false), sound);
 }
 
 // --- 掴み ---------------------------------------------------------------
@@ -1282,6 +1684,7 @@ function hoverHandle() {
 }
 
 function beginGrab(piece, hitPoint) {
+  pushUndo();
   grab.piece = piece;
   piece.settle = null;
   const b = piece.body;
@@ -1408,11 +1811,13 @@ function endGrab() {
     : spot.stacks
       ? spot.topY + piece.size.t / 2
       : surfaceY(piece, spot, captured);
-  // 運んでいる高さの下限。**駒がどこまで持ち上げられているかを基準にする。**
+  // 運んでいる高さの下限。**`tick` の `grab.baseY` と同じ基準でなければいけない。**
+  // ここがずれると、その差をまるごと「高く持ち上げすぎ」と数えてしまい、
+  // 吸着に失敗して駒が物理で落ち、面にぶつかる音（ﾊﾞﾁｯ）になる。
   //
-  // 駒台では盤面（TOP_Y）が下限なので、盤より低い駒台の上では必ずその差だけ余分に浮く。
-  // それを「高く持ち上げすぎ」と数えると、駒台にはいつまでも吸着できず、
-  // 物理で落ちて駒台にぶつかる音（ﾊﾞﾁｯ）になってしまう。
+  // 駒台と駒箱は**その面から**測る（`tick` も `under.topY` を使う）。
+  // かつてどちらも盤面（TOP_Y）にしていたが、**駒箱は畳に直置きで底が 0.9cm しかない**ので
+  // 持つ高さが 20cm 以上浮き、狙った所に置けなくなっていた。
   //
   // 盤では**取る駒の上まで手が上がっている**（`tick` の `grab.baseY` が `surfaceY` で、
   // そこは取る駒を除かない）。ここを `restY`（取る駒はどくので低い）で測ると、その差＝
@@ -1422,7 +1827,7 @@ function endGrab() {
   // ＝「銀で歩は取れるのに角交換ができない」。取る駒も数えて基準を揃える。
   const floorY = !spot ? 0
     : spot.stacks
-      ? Math.max(restY, TOP_Y + piece.size.t / 2)
+      ? restY
       : surfaceY(piece, spot, null);
   const height = spot ? b.position.y - floorY : 0;
   // 面にめり込んでいないか。**基準は駒が実際に乗る面（restY）**で、高さの上限とは別に見る。
@@ -1469,6 +1874,21 @@ function endGrab() {
   const pl = ok && spot.kind === "stand"
     ? standPlacement(piece, spot.stand, spot.x, spot.z)
     : null;
+  // 単独で置くときに収まる先。**音の判定で使う移動距離もここから測る**
+  // （壁や隣の駒で押し戻された分を数えないと、動いた距離が実際とずれる）。
+  //
+  // 順に「壁の内側へ」「他の駒から押し出す」「もう一度壁の内側へ」。
+  // 最後にもう一度収めるのは、押し出した先が壁を越えることがあるため。
+  // それでもまだ重なるほど詰まっているときは、`stackSurfaceY` が段を上げて逃がす。
+  const solo = (() => {
+    if (!ok || !spot.stacks || (pl && pl.base)) return null;
+    let s = fitInside(spot, piece, pl ? pl.x : spot.x, pl ? pl.z : spot.z, grab.yaw);
+    const others = (spot.kind === "box"
+      ? pieces.filter((p) => nearestBox(p.body.position.x, p.body.position.z))
+      : piecesOnStand(spot.stand)).filter((p) => p !== piece && p !== captured);
+    s = pushOutOfPieces(piece, s.x, s.z, grab.yaw, others, spot.stackR ?? 0);
+    return fitInside(spot, piece, s.x, s.z, grab.yaw);
+  })();
 
   // 升に収めるときの揺らぎ。中心ぴったりには置かない（`wobbleOffset` を読む）。
   const wob = ok && !pl ? wobbleOffset(spot, b.position.x, b.position.z, grab.vel) : null;
@@ -1476,8 +1896,8 @@ function endGrab() {
   // 駒が実際に動いた距離。手の経路長ではない。
   // 経路長で測ると、升の隅で掴んで隣の升へ吸着させたとき「ほとんど動かしていない」
   // ことになって無音になる（駒は1升動いているのに）。
-  const endX = pl ? pl.x : ok ? spot.x + (wob ? wob.x : 0) : b.position.x;
-  const endZ = pl ? pl.z : ok ? spot.z + (wob ? wob.z : 0) : b.position.z;
+  const endX = solo ? solo.x : pl ? pl.x : ok ? spot.x + (wob ? wob.x : 0) : b.position.x;
+  const endZ = solo ? solo.z : pl ? pl.z : ok ? spot.z + (wob ? wob.z : 0) : b.position.z;
   const moved = Math.hypot(endX - grab.origin.x, endZ - grab.origin.z);
 
   // ちょんと触って離しただけなら、持ち上げていないものとして扱う。
@@ -1548,10 +1968,11 @@ function endGrab() {
       // 誰の肩にも寄らず単独で置いた（駒箱はいつもこちら。中に並べ方の決まりは無い）。
       // **下に駒がいれば段が上がる。** 寄り添う側（上の分岐）は肩を接して**同じ段**に
       // 並ぶので、台の上面のままでよい。
-      const px = pl ? pl.x : spot.x;
-      const pz = pl ? pl.z : spot.z;
+      // **入れ物の内側に収める**（`fitInside`。壁にめり込ませない）。上で出してある。
+      const px = solo ? solo.x : pl ? pl.x : spot.x;
+      const pz = solo ? solo.z : pl ? pl.z : spot.z;
       startSettle(piece,
-        new THREE.Vector3(px, stackSurfaceY(piece, px, pz, captured), pz),
+        new THREE.Vector3(px, stackSurfaceY(piece, px, pz, captured, grab.yaw), pz),
         // **駒台では手元の値から作る。** 駒側（`settledQuaternion`）を見ると、
         // 揃えるモードでいま裏返したぶんが間に合わないうえ、**180度単位に丸めてしまう**ので
         // 駒台でつけた角度が消える（「成りと向き変更で角度を消さない」と同じ話）。
@@ -1617,10 +2038,12 @@ function canPromote(piece) {
 /** 駒を裏返す／向きを変える。turn は yaw に足す角度。 */
 function setPieceState(piece, nextFlip, turn) {
   if (grab.piece === piece) {
+    // 掴んでいる駒は「掴む前」を beginGrab が既に積んである。ここで積むと段が二重になる。
     grab.flipped = nextFlip;
     grab.yaw += turn;
     return;
   }
+  pushUndo();
   // **基準は行き先の姿勢**（`pieceYaw`）。収まりかけの駒は途中の姿勢を持っているので、
   // そこから作ると連続で押したときに角度が巻き戻る（後手成へ進まず先手成に戻る）。
   // 180度**足す**だけにする。0/180度に丸めると、駒台でつけてある角度が消えてしまう。
@@ -1856,6 +2279,7 @@ function showBox(on) {
 function spillBox() {
   const list = pieces.filter((p) => nearestBox(p.body.position.x, p.body.position.z));
   if (!list.length) return;
+  pushUndo();
   clearSelection();
   clearArrow(); // 盤面が変わる
   // **重ならないように並べてから落とす。** ここが跳ねの正体だった。
@@ -1926,15 +2350,14 @@ function spillBox() {
   renderer.shadowMap.needsUpdate = true;
 }
 
-/** 盤と駒台にある駒を駒箱へ片付ける。**升の駒も持ち駒も全部**。 */
-function boxAll() {
-  if (!KOMABAKO.visible) return;
-  clearSelection();
-  clearArrow();
-  const list = pieces.filter((p) => !nearestBox(p.body.position.x, p.body.position.z));
-  // **格子に並べて入れる。** 散らして入れると偏って高く積み上がり、**箱の高さを超えて
-  // 駒が壁からはみ出す**（実測 6.73cm。箱は 5.4cm）。40 枚を 4×4 の 3 段に収める。
-  // 位置と向きに少しだけ揺らぎを足して、整列しきった見た目にはしない。
+/**
+ * 渡した駒を駒箱へ入れる。片付けも、駒落ちで外した駒の行き先もここを通る。
+ *
+ * **格子に並べて入れる。** 散らして入れると偏って高く積み上がり、**箱の高さを超えて
+ * 駒が壁からはみ出す**（実測 6.73cm。箱は 5.4cm）。40 枚を 4×4 の 3 段に収める。
+ * 位置と向きに少しだけ揺らぎを足して、整列しきった見た目にはしない。
+ */
+function putIntoBox(list) {
   const COLS = 4, ROWS = 4, PER = COLS * ROWS;
   const cw = BOX_INNER.w / COLS, cd = BOX_INNER.d / ROWS;
   const LAYER = 0.92; // 段の間隔。いちばん厚い駒（王 0.90）より少し広く
@@ -1951,6 +2374,163 @@ function boxAll() {
     b.updateMassProperties();
     b.collisionResponse = true;
   });
+
+  // **格子に置いただけでは、揺らぎのぶん隣とわずかに触れることがある。**
+  // 王（3.0×3.2）だと格子の余白は 0.1cm しかないので、向きの揺らぎだけで超える。
+  // 同じ段の駒どうしで押し出して解く（起きるのは 0.5cm 以下の浅い重なり）。
+  for (let iter = 0; iter < 8; iter++) {
+    let moved = false;
+    for (const p of list) {
+      const pp = p.body.position;
+      const yaw = yawOf(p.mesh.quaternion);
+      const same = list.filter((q) => q !== p && Math.abs(q.body.position.y - pp.y) < 0.3);
+      // stackR に 0 を渡す＝真上でも押し出す（同じ段しか相手にしていないので当然）
+      let s = pushOutOfPieces(p, pp.x, pp.z, yaw, same, 0);
+      s = fitInside({ kind: "box" }, p, s.x, s.z, yaw);
+      if (Math.hypot(s.x - pp.x, s.z - pp.z) < 0.001) continue;
+      pp.x = s.x; pp.z = s.z;
+      p.mesh.position.copy(pp);
+      moved = true;
+    }
+    if (!moved) break;
+  }
+  renderer.shadowMap.needsUpdate = true;
+}
+
+// --- 短い知らせ ---------------------------------------------------------
+//
+// **盤を見ながら読むものなので幕は張らない**（振り駒の結果は盤の駒そのものだし、
+// 読み込みの失敗もその場で直せる）。数秒で消える。
+
+const toastEl = document.getElementById("toast");
+let toastTimer = 0;
+function toast(text, ms = 4000) {
+  if (!toastEl) return;
+  toastEl.textContent = text;
+  toastEl.hidden = false;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { toastEl.hidden = true; }, ms);
+}
+
+// --- 振り駒 -------------------------------------------------------------
+//
+// **物理でしか作れない操作。** 歩 5 枚を盤にまいて、表（歩）が多ければ先手、
+// 裏（と）が多ければ後手。
+//
+// - **結果は数えて見せるだけで、手番は設定しない**（ルールは強制しない）
+// - 駒は**駒箱から取り、足りなければ盤の歩を借りる**。借りると並びは崩れるが
+//   「元に戻す」で戻せる
+// - **5 枚揃わなければ振らない。** 4 枚では 2 対 2 で決まらない
+// - **立った駒があれば振り直し**（実物と同じ）
+// - **表裏は初期姿勢もランダムにする。** 落とすだけだと初期の向きが結果に残る。
+//   実物でも手の中で混ぜてから振る
+// - まく前に**重ならないように散らす**。重なった状態から始めると物理がめり込みを
+//   解こうとして弾き飛ぶ（駒箱の「盤にあける」と同じ）
+
+const FURI_N = 5;
+let furigoma = null; // { list, borrowed, deadline } 落ち着くまで tick が見張る
+
+function furigomaSource() {
+  const fu = pieces.filter((p) => p.kindId === "FU");
+  const list = fu.filter((p) => nearestBox(p.body.position.x, p.body.position.z)).slice(0, FURI_N);
+  if (list.length < FURI_N) {
+    const onBoard = fu.filter((p) => {
+      if (list.includes(p)) return false;
+      const at = placeAt(p.body.position.x, p.body.position.z);
+      return !!at && at.kind === "square";
+    });
+    list.push(...onBoard.slice(0, FURI_N - list.length));
+  }
+  return list;
+}
+
+function furigomaStart() {
+  const list = furigomaSource();
+  if (list.length < FURI_N) {
+    toast(`振るには歩が ${FURI_N} 枚要ります（いま ${list.length} 枚）。駒箱か盤に歩を用意してください。`);
+    return;
+  }
+  const borrowed = list.filter((p) => !nearestBox(p.body.position.x, p.body.position.z)).length;
+  pushUndo();
+  clearSelection();
+  clearArrow();
+  showSettings(false); // 盤を見せる
+
+  // 重ならない場所を投げて選ぶ（棄却法。駒箱の「盤にあける」と同じ考え方）。
+  // **狭くしすぎない。** 3.8cm では落ちながら寄って駒の上に乗り上がる（実測で 5 枚中 2 枚）。
+  // 盤は半径 16.5cm あるので、5.2cm でも端までは十分余る。
+  const R = 5.2, MIN = 3.0;
+  const spots = [];
+  for (let t = 0; t < 600 && spots.length < list.length; t++) {
+    const a = Math.random() * Math.PI * 2;
+    const r = Math.sqrt(Math.random()) * R;
+    const x = Math.cos(a) * r, z = Math.sin(a) * r;
+    if (spots.every((s) => Math.hypot(s.x - x, s.z - z) >= MIN)) spots.push({ x, z });
+  }
+
+  const tilt = new THREE.Quaternion();
+  const q = new THREE.Quaternion();
+  list.forEach((p, i) => {
+    p.settle = null;
+    const b = p.body;
+    b.type = CANNON.Body.DYNAMIC;
+    b.updateMassProperties();
+    b.collisionResponse = true;
+    b.wakeUp();
+    const s = spots[i] || { x: 0, z: 0 };
+    // 段でずらして落とす（同じ高さから落とすと落ち際で当たる）
+    b.position.set(s.x, TOP_Y + 3.2 + i * 0.8, s.z);
+    // 表裏と向きをランダムに作り、そこへ少し傾きを掛ける
+    flatQuaternion(Math.random() * Math.PI * 2, Math.random() < 0.5, q);
+    tilt.setFromEuler(new THREE.Euler((Math.random() - 0.5) * 0.7, 0, (Math.random() - 0.5) * 0.7));
+    q.premultiply(tilt);
+    b.quaternion.set(q.x, q.y, q.z, q.w);
+    // **勢いは控えめにする。** 散らして落としても、着地後に転がって寄れば駒の上に
+    // 乗り上がる（±9cm/s・±14rad/s では 50 枚中 12 枚が乗った）。
+    // 表裏は初期姿勢で既にランダムなので、回して混ぜる必要はない。
+    b.velocity.set((Math.random() - 0.5) * 4, 0, (Math.random() - 0.5) * 4);
+    b.angularVelocity.set((Math.random() - 0.5) * 6, (Math.random() - 0.5) * 6, (Math.random() - 0.5) * 6);
+    p.mesh.position.copy(b.position);
+    p.mesh.quaternion.copy(b.quaternion);
+  });
+  playSpill();
+  // 落ちて跳ねている間の駒音は鳴らさない（`collisionSound` の先頭を読む）。
+  spillQuietUntil = performance.now() + 1200;
+  calmDeadline = performance.now() + 5000;
+  furigoma = { list, borrowed, deadline: performance.now() + 6500 };
+  renderer.shadowMap.needsUpdate = true;
+}
+
+/** 落ち着いたら数える。tick から呼ばれる。 */
+function furigomaFinish() {
+  const { list, borrowed } = furigoma;
+  furigoma = null;
+  // **立った駒は数えない。** 実物でも振り直す
+  const standing = list.filter((p) => tiltDegrees(p.mesh.quaternion) > 45).length;
+  if (standing) {
+    toast(`駒が ${standing} 枚立ちました。もう一度振ってください。`);
+    return;
+  }
+  const back = list.filter((p) => isFlipped(p.mesh.quaternion)).length;
+  const face = list.length - back;
+  let msg = `歩 ${face} 枚・と ${back} 枚 → ${face > back ? "先手" : "後手"}`;
+  if (borrowed) msg += `（盤の歩を ${borrowed} 枚使いました）`;
+  toast(msg, 6000);
+  return { face, back, standing: 0 };
+}
+
+/**
+ * 盤と駒台にある駒を駒箱へ片付ける。**升の駒も持ち駒も全部**。
+ *
+ * **箱に入っている駒も含めて並べ直す。** 外の駒だけを格子に入れると、
+ * 既に入っている駒と同じ場所に重なる（片付けたのにめり込む）。
+ */
+function boxAll() {
+  if (!KOMABAKO.visible) return;
+  pushUndo();
+  clearSelection();
+  clearArrow();
+  putIntoBox(pieces.slice());
   playPlace(0.8);
   renderer.shadowMap.needsUpdate = true;
 }
@@ -1959,6 +2539,7 @@ function boxAll() {
 
 /** 散らばった駒を升と駒台に整える。使わなければ物理のまま。 */
 function tidyAll() {
+  pushUndo();
   clearSelection(); // 駒が動くので ⟳ の位置が合わなくなる
   // 散らばった駒が升に収まる＝局面が変わりうるので、解析した最善手は捨てる。
   clearArrow();
@@ -2299,10 +2880,17 @@ function tick(now) {
     const under = placeAt(held.body.position.x, held.body.position.z);
     if (under) {
       // 駒台や駒箱の上では、そこにある駒に乗り上げない。盤の上だけ、駒があれば手を上げる。
-      // ただしどちらも盤より低いので、運ぶ高さは盤面を下限にする。
-      // そうしないと駒台から盤へ移した瞬間に駒が盤に埋まってせり上がる。
+      //
+      // **持つ高さはその場所の面から測る。** かつてはどこでも盤面（TOP_Y）を下限に
+      // していたが、**駒箱は畳に直に置いてあるので底が 0.9cm しかなく、盤と同じ高さで
+      // 持つと箱の底から 20.45cm も浮いていた**（盤なら 3.35cm）。
+      // 高く浮くほど、指の光線と運ぶ平面の交点が奥へずれるので、
+      // **狙った場所に置けなくなる**（駒箱の中で駒をどかしたいときに特に困る）。
+      //
+      // 場所が変わっても駒が飛ばないのは、下の追従（`followRate`）が
+      // 滑らかに寄せるため。駒台から盤へ移すときも 0.1 秒ほどで上がりきる。
       grab.baseY = under.stacks
-        ? TOP_Y + held.size.t / 2
+        ? under.topY + held.size.t / 2
         : surfaceY(held, under);
     }
     // 掴んですぐ動き出したら、持ち上げずにすべらせているとみなす。
@@ -2437,6 +3025,13 @@ function tick(now) {
       if (p.body.sleepState !== 2) p.body.sleep();
     }
     calmDeadline = 0;
+  }
+
+  // 振り駒。**全部寝てから数える**（転がっている途中の表裏は当てにならない）。
+  // 上の `calmDeadline` が先に手で寝かせるので、期限は保険。
+  if (furigoma) {
+    const done = furigoma.list.every((p) => p.body.sleepState === 2) || now > furigoma.deadline;
+    if (done) furigomaFinish();
   }
 
   world.step(1 / 120, dt, 6);
@@ -2787,8 +3382,7 @@ scrim.addEventListener("click", () => showPanel(null));
 // **戻れるだけでよい。** 本に栞を挟むのと同じ感覚で、複数登録でき、
 // 名前は付けない。終了後に覚えている必要もないので保存もしない（リロードで消える）。
 //
-// **盤面（readBoard）ではなく駒の姿勢をそのまま覚える。** 読み取りは升に収まった駒しか
-// 見ないので、崩れた盤面も駒台の並びも復元できない。
+// 姿勢の控えと戻しは上の `capturePoses` / `applyPoses`。
 //
 // 見分けるのは**挟んだ瞬間の画面そのもの**。名前が無い以上、絵で見分ける
 // しかない。9×9 の図を起こす手もあるが、それだと readBoard と同じ弱点を抱える。
@@ -2804,70 +3398,107 @@ const markList = document.getElementById("marklist");
 // 一覧の幅は 328px 前後なので、640 あれば dpr 2 の画面でも足りる。
 const MARK_W = 640, MARK_H = 480;
 
+/**
+ * いまの盤面を canvas に描く。栞の絵も画像の保存もここを通る。
+ *
+ * **描画バッファは合成のあと捨てられる**ので、その場で描き直してすぐ読む
+ * （`preserveDrawingBuffer` を立てれば要らないが、そのぶん常に遅くなる）。
+ *
+ * 画面より大きい大きさを渡されたら、**描画バッファを一時的にそこまで広げて描き直す**。
+ * 画面の画素を引き伸ばしても粗いままなので、保存用にはこれが要る。
+ * **カメラの縦横比も一緒に変える**（変えないと写る範囲がずれる）。
+ * 元に戻したあともう一度描くのは、次のフレームまで壊れた絵を残さないため。
+ */
+function renderToCanvas(w, h) {
+  const src = renderer.domElement;
+  const keepW = src.width, keepH = src.height;
+  const keepRatio = renderer.getPixelRatio();
+  const keepAspect = camera.aspect;
+  const bigger = w > keepW || h > keepH;
+  if (bigger) {
+    renderer.setPixelRatio(1);
+    renderer.setSize(w, h, false); // false ＝ CSS の大きさは触らない
+    camera.aspect = w / h;
+    camera.updateProjectionMatrix();
+  }
+  renderer.render(scene, camera);
+
+  const cv = document.createElement("canvas");
+  cv.width = w;
+  cv.height = h;
+  // 画面の中央から求める形に切る。盤は中央にあるので、どちらの持ち方でも残る。
+  const sw = Math.min(src.width, (src.height * w) / h);
+  const sh = Math.min(src.height, (src.width * h) / w);
+  cv.getContext("2d").drawImage(
+    src, (src.width - sw) / 2, (src.height - sh) / 2, sw, sh, 0, 0, w, h);
+
+  if (bigger) {
+    renderer.setPixelRatio(keepRatio);
+    renderer.setSize(keepW / keepRatio, keepH / keepRatio, false);
+    camera.aspect = keepAspect;
+    camera.updateProjectionMatrix();
+    renderer.render(scene, camera);
+  }
+  return cv;
+}
+
 /** 挟んだ瞬間の画面を切り出して取っておく。 */
 function snapshot() {
-  // WebGL の描画バッファは合成のあと捨てられるので、**その場で描き直してすぐ読む**。
-  // preserveDrawingBuffer を立てれば要らないが、そのぶん常に遅くなる。
-  renderer.render(scene, camera);
+  return renderToCanvas(MARK_W, MARK_H).toDataURL("image/jpeg", 0.86);
+}
+
+// 保存する画像の長辺。**画面の縦横比は保つ**（見えているものをそのまま大きく出す）。
+const SHOT_LONG = 1920;
+
+/**
+ * いまの盤面を PNG で保存する。
+ *
+ * **data URL ではなく Blob で渡す。** 1920px の PNG は数 MB あり、data URL にすると
+ * 文字列として全部メモリに載る。
+ */
+let saving = false;
+
+function saveImage() {
+  if (saving) return; // エンコード中の連打で何枚も落とさない
   const src = renderer.domElement;
-  const cv = document.createElement("canvas");
-  cv.width = MARK_W;
-  cv.height = MARK_H;
-  // 画面の中央から 4:3 を切る。盤は画面の中央にあるので、どちらの持ち方でも残る。
-  const sw = Math.min(src.width, (src.height * MARK_W) / MARK_H);
-  const sh = Math.min(src.height, (src.width * MARK_H) / MARK_W);
-  cv.getContext("2d").drawImage(
-    src, (src.width - sw) / 2, (src.height - sh) / 2, sw, sh, 0, 0, MARK_W, MARK_H);
-  return cv.toDataURL("image/jpeg", 0.86);
+  const ratio = src.width / src.height || 1;
+  const w = ratio >= 1 ? SHOT_LONG : Math.round(SHOT_LONG * ratio);
+  const h = ratio >= 1 ? Math.round(SHOT_LONG / ratio) : SHOT_LONG;
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, "0");
+  const name = `shogi-${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}`
+    + `-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}.png`;
+  // **押した手応えを先に出す。** 1920px の PNG は書き出しに 1 秒ほどかかるので
+  // （実測 1.05 秒）、黙って止まっていると効かなかったように見える。
+  saving = true;
+  toast("画像を作っています…", 30000);
+  renderToCanvas(w, h).toBlob((blob) => {
+    saving = false;
+    if (!blob) { toast("画像を作れませんでした"); return; }
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = name;
+    a.click();
+    // すぐ捨てるとダウンロードが始まる前に消えることがある
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+    toast(`${name}（${w}×${h}）を保存しました`);
+  }, "image/png");
 }
 
 function addBookmark() {
   // 手に持ったままだと、その駒だけ宙に浮いた姿勢で覚えることになる
   if (grab.piece) endGrab();
   if (chainGrab.list) endChainGrab();
-  bookmarks.unshift({
-    img: snapshot(),
-    // **収まりかけの駒は行き先を覚える。** 途中の姿勢を覚えると、
-    // 戻したときに升の手前で止まった中途半端な配置になる。
-    poses: pieces.map((p) => ({
-      p,
-      x: p.settle ? p.settle.to.x : p.body.position.x,
-      y: p.settle ? p.settle.to.y : p.body.position.y,
-      z: p.settle ? p.settle.to.z : p.body.position.z,
-      q: (p.settle ? p.settle.toQ : p.mesh.quaternion).clone(),
-    })),
-  });
+  bookmarks.unshift({ img: snapshot(), poses: capturePoses() });
   renderMarks();
 }
 
 function restoreBookmark(bm) {
-  if (grab.piece) endGrab();
-  if (chainGrab.list) endChainGrab();
-  clearSelection();
-  for (const s of bm.poses) {
-    const b = s.p.body;
-    s.p.settle = null;
-    // 駒台の持ち駒と駒箱の駒は静止物に戻す（重ねると箱どうしが重なるため）。
-    const at = placeAt(s.x, s.z);
-    const onStand = !!at && at.stacks;
-    b.type = onStand ? CANNON.Body.STATIC : CANNON.Body.DYNAMIC;
-    b.updateMassProperties();
-    b.collisionResponse = true;
-    b.position.set(s.x, s.y, s.z);
-    b.quaternion.set(s.q.x, s.q.y, s.q.z, s.q.w);
-    b.velocity.setZero();
-    b.angularVelocity.setZero();
-    s.p.mesh.position.copy(b.position);
-    s.p.mesh.quaternion.copy(b.quaternion);
-    if (!onStand) b.sleep();
-  }
-  // **栞に戻すのは指し手ではない。** 最終手ハイライトは捨てる（resetHirate と同じ扱い）。
-  lastMove = null;
-  prevBoard = null;
-  // 盤面がまるごと入れ替わるので、解析した局面の最善手も捨てる。
-  clearArrow();
-  // ここでメッシュまで動かすので tick の比較には出ない。
-  renderer.shadowMap.needsUpdate = true;
+  // 栞へ跳んだこと自体も戻せるようにする（**`applyPoses` では積まない**。
+  // `undo` がそこを通るので、積むと戻るたびに段が増えて出られなくなる）。
+  pushUndo();
+  applyPoses(bm.poses);
 }
 
 function renderMarks() {
@@ -2909,6 +3540,7 @@ function renderMarks() {
   });
 }
 document.getElementById("btn-mark").addEventListener("click", addBookmark);
+document.getElementById("btn-shot").addEventListener("click", saveImage);
 renderMarks();
 
 // --- 解析（USI エンジン） -----------------------------------------------
@@ -2927,6 +3559,107 @@ let showArrow = true;
 let analysing = false;
 
 segment("side", (v) => { analysisSide = v === "w" ? 1 : 0; });
+
+// --- 局面の受け渡し（SFEN） ---------------------------------------------
+//
+// **局面ひとつだけ。棋譜は扱わない**（「何をもって指したか」が決められないため）。
+// 読み込んだらそこで終わりで、あとは今までどおり手で触る。
+//
+// - **駒箱の駒は局面に数えない**（`readBoard` の `box`）ので、駒落ちがそのまま
+//   SFEN として出入りする。読み書きが対称になる
+// - 手番は盤面からは決まらないので、解析パネルの「手番」と共有する。
+//   読み込んだら**そのボタンを押す**（`setSegment`）ので、そのまま解析にかけられる
+// - 手数は持たない（棋譜が無い）ので、出すときは常に 1
+
+const sfenBox = document.getElementById("sfen");
+
+/** いまの盤面を SFEN にしてテキスト欄へ出す。 */
+function dumpSfen() {
+  const read = readBoard();
+  const text = toSfen(read, analysisSide);
+  if (sfenBox) {
+    sfenBox.value = text;
+    sfenBox.select();
+  }
+  // **読めない駒があっても出す。** ただし黙って落とすと、欠けた局面を
+  // 正しいものとして持ち出してしまう。
+  const { problems, loose } = checkPosition(read);
+  const notes = [];
+  if (loose) notes.push(`升に収まっていない駒が ${loose} 枚あります（SFEN には入りません）`);
+  if (problems.length) notes.push(problems[0]);
+  navigator.clipboard?.writeText(text).then(
+    () => toast(notes.length ? `コピーしました。ただし ${notes.join("／")}` : "SFEN をコピーしました", notes.length ? 6000 : 3000),
+    () => toast(notes.length ? `テキスト欄に出しました。ただし ${notes.join("／")}` : "テキスト欄に出しました", notes.length ? 6000 : 3000)
+  );
+}
+
+/** テキスト欄の SFEN を盤に並べる。 */
+function loadSfen() {
+  const res = fromSfen(sfenBox ? sfenBox.value : "");
+  if (res.error) {
+    toast(`読み込めません：${res.error}`, 6000);
+    return false;
+  }
+  // 盤の向きは駒の持ち主で決まる（段では決まらない。SFEN は駒ごとに先後を持つ）
+  const list = res.board.map((e) => [e.kindId, e.file, e.rank, e.owner === 1 ? Math.PI : 0, e.promoted]);
+  setupPosition(list, res.hands);
+  setSegment("side", res.turn === 1 ? "w" : "b");
+  showSettings(false); // 並んだ盤を見せる
+  const held = res.hands[0].length + res.hands[1].length;
+  toast(`並べました（盤 ${list.length} 枚・持ち駒 ${held} 枚・${res.turn === 1 ? "後手番" : "先手番"}）`);
+  return true;
+}
+
+document.getElementById("btn-sfen-load")?.addEventListener("click", loadSfen);
+document.getElementById("btn-sfen-dump")?.addEventListener("click", dumpSfen);
+
+/**
+ * いまの局面を指す URL を作る。**局面を人に渡すための口**で、受け取った側は
+ * 開くだけでその局面から触れる（そこから先は今までどおり手で並べる）。
+ *
+ * SFEN は空白と `/` を含むので `encodeURIComponent` を通す。
+ */
+function shareUrl() {
+  const text = toSfen(readBoard(), analysisSide);
+  const url = `${location.origin}${location.pathname}?sfen=${encodeURIComponent(text)}`;
+  if (sfenBox) { sfenBox.value = url; sfenBox.select(); }
+  const { loose } = checkPosition(readBoard());
+  const note = loose ? `。ただし升に収まっていない駒が ${loose} 枚あります（入りません）` : "";
+  navigator.clipboard?.writeText(url).then(
+    () => toast(`リンクをコピーしました${note}`, loose ? 6000 : 3000),
+    () => toast(`テキスト欄に出しました${note}`, loose ? 6000 : 3000)
+  );
+}
+document.getElementById("btn-sfen-url")?.addEventListener("click", shareUrl);
+
+/**
+ * `?sfen=…` 付きで開かれたら、その局面から始める。
+ *
+ * **読めなければ平手のまま黙って始める**（理由は知らせに出すが、盤は普通に使える）。
+ * リンクを踏んだ人にとっては、盤が出ないことのほうが困る。
+ * **読み込みは起動時の 1 回だけ**で、そのあとは今までどおり手で触る（棋譜にはしない）。
+ */
+function applyUrlPosition() {
+  let text = null;
+  try {
+    text = new URLSearchParams(location.search).get("sfen");
+  } catch { return false; }
+  if (!text) return false;
+  const res = fromSfen(text);
+  if (res.error) {
+    toast(`リンクの局面を読めません：${res.error}`, 6000);
+    return false;
+  }
+  const list = res.board.map((e) => [e.kindId, e.file, e.rank, e.owner === 1 ? Math.PI : 0, e.promoted]);
+  setupPosition(list, res.hands);
+  setSegment("side", res.turn === 1 ? "w" : "b");
+  if (sfenBox) sfenBox.value = toSfen(readBoard(), res.turn);
+  // **起動そのものは戻せる操作ではない。** ここで積まれた段は捨てる（`resetHirate` と同じ扱い）
+  undoStack.length = 0;
+  refreshUndo();
+  toast(`リンクの局面を並べました（${res.turn === 1 ? "後手番" : "先手番"}）`);
+  return true;
+}
 segment("depth", (v) => { analysisDepth = +v; });
 segment("arrow", (v) => { showArrow = v === "on"; if (!showArrow) hideArrow(); else redrawArrow(); });
 
@@ -3289,7 +4022,10 @@ document.getElementById("btn-forget").addEventListener("click", () => {
 });
 
 document.getElementById("btn-tidy").addEventListener("click", tidyAll);
-document.getElementById("btn-reset").addEventListener("click", resetHirate);
+document.getElementById("btn-furigoma").addEventListener("click", furigomaStart);
+for (const b of document.querySelectorAll("#handicaps button")) {
+  b.addEventListener("click", () => setupHandicap(b.dataset.h));
+}
 
 // スライダー
 const defs = [
@@ -3357,6 +4093,120 @@ function buildSliders(containerId, list) {
   }
 }
 buildSliders("params-volume", volumeDefs);
+
+// --- 効果音の差し替え ---------------------------------------------------
+//
+// 実物の盤を持っている人が、自分の駒音で遊べるようにする。
+//
+// - **置き場所は IndexedDB。** localStorage（5MB）に wav は入らないし、設定の
+//   `STORE_KEY` に混ぜると音が読めないだけで設定ごと壊れかねない
+// - **`sound.js` の `FILES` は触らない。** 同梱の音は公開用と個人用で本数が違うので、
+//   そこを書き換えると版どうしの差が広がる（差し替えは別に持って上書きするだけ）
+// - **1 種類に何本でも入れられる。** 鳴るたびにその中から選ばれるので、
+//   同じ音の繰り返しに聞こえない（同梱の駒音と同じ考え方）
+// - **「最初の状態に戻す」では消さない。** あれは設定を捨てるボタンで、
+//   差し替えた音は設定ではなく素材
+
+const SOUND_KINDS = [
+  ["clack", "駒を指す音"],
+  ["slide", "すべらせる音"],
+  ["place", "駒台に置く音"],
+  ["spill", "ぶちまける音"],
+];
+const SOUND_DB = "shogi-sounds";
+const SOUND_STORE = "files";
+const SOUND_MAX = 4 * 1024 * 1024; // 1 本の上限。効果音にこれ以上は要らない
+
+/** **読めなければ黙って諦める。** 音が入れられないせいで盤が出ないほうが困る。 */
+function soundDB() {
+  return new Promise((resolve, reject) => {
+    if (!window.indexedDB) { reject(new Error("indexedDB がありません")); return; }
+    const req = indexedDB.open(SOUND_DB, 1);
+    req.onupgradeneeded = () => req.result.createObjectStore(SOUND_STORE);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+function soundTx(mode, run) {
+  return soundDB().then((db) => new Promise((resolve, reject) => {
+    const tx = db.transaction(SOUND_STORE, mode);
+    const req = run(tx.objectStore(SOUND_STORE));
+    tx.oncomplete = () => resolve(req ? req.result : undefined);
+    tx.onerror = () => reject(tx.error);
+  }));
+}
+
+const dbGetSound = (kind) => soundTx("readonly", (s) => s.get(kind));
+const dbPutSound = (kind, list) => soundTx("readwrite", (s) => s.put(list, kind));
+const dbDelSound = (kind) => soundTx("readwrite", (s) => s.delete(kind));
+
+const soundsPanel = document.getElementById("sounds");
+
+function renderSoundRows() {
+  if (!soundsPanel) return;
+  soundsPanel.replaceChildren();
+  for (const [kind, label] of SOUND_KINDS) {
+    const row = document.createElement("div");
+    row.className = "sndrow";
+    const name = document.createElement("span");
+    name.className = "lb";
+    name.textContent = label;
+    const state = document.createElement("span");
+    state.className = "st";
+    state.textContent = isCustomSound(kind) ? "差し替え済み" : "同梱の音";
+    const pick = document.createElement("button");
+    pick.textContent = "選ぶ";
+    const reset = document.createElement("button");
+    reset.textContent = "戻す";
+    reset.disabled = !isCustomSound(kind);
+
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = "audio/*";
+    input.multiple = true; // 何本入れてもよい（鳴るたびに選ばれる）
+    input.hidden = true;
+    pick.addEventListener("click", () => input.click());
+    input.addEventListener("change", async () => {
+      const files = [...input.files];
+      input.value = ""; // 同じファイルをもう一度選べるように
+      if (!files.length) return;
+      const big = files.find((f) => f.size > SOUND_MAX);
+      if (big) { toast(`${big.name} が大きすぎます（1 本 4MB まで）`); return; }
+      initAudio(); // 音を鳴らす前でも復号できるように起こしておく
+      const list = await Promise.all(files.map((f) => f.arrayBuffer()));
+      // **復号できるか先に確かめる**（`setSound` は駄目なら元の音へ戻す）
+      const ok = await setSound(kind, list);
+      if (!ok) { toast("その音は読めませんでした（wav・mp3・ogg などを選んでください）"); return; }
+      await dbPutSound(kind, list).catch(() => {}); // 残せなくても今回は鳴る
+      renderSoundRows();
+      toast(`${label}を差し替えました（${files.length} 本）`);
+    });
+
+    row.append(name, state, pick, reset, input);
+    reset.addEventListener("click", async () => {
+      await setSound(kind, null);
+      await dbDelSound(kind).catch(() => {});
+      renderSoundRows();
+      toast(`${label}を同梱の音に戻しました`);
+    });
+    soundsPanel.append(row);
+  }
+}
+
+/** 前に差し替えた音があれば読み直す。**駄目なら黙って同梱の音のまま。** */
+async function restoreSounds() {
+  for (const [kind] of SOUND_KINDS) {
+    try {
+      const list = await dbGetSound(kind);
+      if (list && list.length) await setSound(kind, list);
+    } catch { /* 読めなければ同梱の音のまま */ }
+  }
+  renderSoundRows();
+}
+
+renderSoundRows();
+restoreSounds();
 buildSliders("params", defs);
 buildSliders("params-hold", holdDefs);
 buildSliders("params-read", readDefs);
@@ -3372,6 +4222,24 @@ window.__proto = {
   world, settleLog,
   // 駒台の寄り添い判定
   standPlacement, attachPose, piecesOnStand, insideStand, shoulderOf, footOf,
+  // 駒の輪郭と押し出し（壁・駒どうしのめり込みを解く）
+  pieceOutline, outlineSeparation, pushOutOfPieces, fitInside,
+  // 盤面をまるごと控える／戻す（栞と「元に戻す」が共有する土台）
+  capturePoses, applyPoses, setupPosition, putIntoBox,
+  // 手合い割
+  setupHandicap, HANDICAPS,
+  // 振り駒
+  furigomaStart, furigomaSource, furigomaFinish, getFurigoma: () => furigoma, toast,
+  // 局面の受け渡し（SFEN）
+  loadSfen, dumpSfen, fromSfen, toSfen, flushSettles, sendToStand,
+  shareUrl, applyUrlPosition,
+  // 盤面の画像
+  renderToCanvas, saveImage, snapshot,
+  // 効果音の差し替え
+  setSound, isCustomSound, dbGetSound, dbPutSound, dbDelSound, restoreSounds, SOUND_KINDS,
+  initAudio, renderSoundRows,
+  // 元に戻す
+  undo, pushUndo, posesEqual, undoStack,
   // 局面の栞
   bookmarks, addBookmark, restoreBookmark, showBookmarks,
   // 駒台・駒箱で重ねたときの段
@@ -3397,6 +4265,12 @@ window.__proto = {
 };
 
 resetHirate();
+// 起動そのものは「戻せる操作」ではない。並べた拍子に積まれた 1 段を捨てる
+// （残すと最初から「戻す」が押せる形になり、押しても何も起きない）。
+undoStack.length = 0;
+refreshUndo();
+// `?sfen=…` 付きで開かれたら、その局面から始める（読めなければ平手のまま）
+applyUrlPosition();
 resize();
 // 覚えている視点があればそこから始める。無ければ盤と駒台が入る距離。
 //

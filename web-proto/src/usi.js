@@ -66,6 +66,104 @@ export function toSfen({ board, hands }, turn) {
   return `${rows.join("/")} ${turn === 1 ? "w" : "b"} ${hand || "-"} 1`;
 }
 
+// 駒の在庫。これを超える SFEN は並べようがないので読まない。
+const STOCK = { FU: 18, KY: 4, KE: 4, GI: 4, KI: 4, KA: 2, HI: 2, OU: 1, GY: 1 };
+
+/**
+ * SFEN を読む。**`toSfen` の逆。**
+ *
+ * 返すのは `{ board, hands, turn }`。`board` は `{ kindId, file, rank, owner, promoted }`
+ * の配列で、**盤の座標や向きには触れない**（それは main.js の仕事）。
+ * `hands` は `[先手の kindId[], 後手の kindId[]]`。
+ *
+ * **玉は先手を OU、後手を GY に割り当てる。** 駒はその 2 つしか無く、SFEN では
+ * どちらも K なので、大文字小文字で振り分けるしかない。
+ *
+ * 読めなければ `{ error }` を返す。**推測して直したりはしない**
+ * （`checkPosition` と同じ考え方で、駄目な理由を言うだけ）。
+ */
+export function fromSfen(text) {
+  const s = String(text || "").trim();
+  if (!s) return { error: "SFEN が空です" };
+  // 「position sfen …」「sfen …」で貼られても読む
+  const body = s.replace(/^position\s+/i, "").replace(/^sfen\s+/i, "").trim();
+  if (/^startpos\b/i.test(body)) {
+    return fromSfen("lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1");
+  }
+
+  const parts = body.split(/\s+/);
+  const [boardText, turnText, handText = "-"] = parts;
+  if (!boardText || !turnText) return { error: "SFEN の形になっていません（盤と手番が要ります）" };
+  if (turnText !== "b" && turnText !== "w") return { error: `手番は b か w です（「${turnText}」でした）` };
+
+  const rows = boardText.split("/");
+  if (rows.length !== 9) return { error: `盤の段が ${rows.length} 個です（9 個必要）` };
+
+  const board = [];
+  for (let i = 0; i < 9; i++) {
+    const rank = i + 1;
+    let file = 9;
+    let promoted = false;
+    for (const ch of rows[i]) {
+      if (ch === "+") {
+        if (promoted) return { error: `${rank}段目に + が続いています` };
+        promoted = true;
+        continue;
+      }
+      if (ch >= "1" && ch <= "9") {
+        if (promoted) return { error: `${rank}段目の + のうしろが数字です` };
+        file -= +ch;
+        continue;
+      }
+      const upper = ch.toUpperCase();
+      const kind = KIND_OF[upper];
+      if (!kind) return { error: `読めない文字「${ch}」があります` };
+      if (file < 1) return { error: `${rank}段目に駒が多すぎます` };
+      const owner = ch === upper ? 0 : 1;
+      // 玉は先手が OU、後手が GY（KIND_OF は GY を返す）
+      board.push({ kindId: kind === "GY" && owner === 0 ? "OU" : kind, file, rank, owner, promoted });
+      file--;
+      promoted = false;
+    }
+    if (promoted) return { error: `${rank}段目が + で終わっています` };
+    if (file !== 0) return { error: `${rank}段目の升が 9 個になりません` };
+  }
+
+  const hands = [[], []];
+  if (handText !== "-") {
+    let n = 0;
+    for (const ch of handText) {
+      if (ch >= "0" && ch <= "9") { n = n * 10 + +ch; continue; }
+      const upper = ch.toUpperCase();
+      const kind = KIND_OF[upper];
+      if (!kind) return { error: `持ち駒に読めない文字「${ch}」があります` };
+      const owner = ch === upper ? 0 : 1;
+      const count = n || 1;
+      if (count > 18) return { error: `持ち駒の枚数が多すぎます（${count}）` };
+      for (let i = 0; i < count; i++) {
+        hands[owner].push(kind === "GY" && owner === 0 ? "OU" : kind);
+      }
+      n = 0;
+    }
+    if (n) return { error: "持ち駒が数字で終わっています" };
+  }
+
+  // **在庫を超えていないか。** 足りないまま並べると黙って落ちるので、ここで止める。
+  const used = new Map();
+  for (const e of [...board, ...hands[0].map((k) => ({ kindId: k })), ...hands[1].map((k) => ({ kindId: k }))]) {
+    used.set(e.kindId, (used.get(e.kindId) || 0) + 1);
+  }
+  for (const [kindId, n] of used) {
+    const max = STOCK[kindId] || 0;
+    if (n > max) {
+      const name = KINDS[kindId]?.name || kindId;
+      return { error: `${name}が ${n} 枚あります（${max} 枚しかありません）` };
+    }
+  }
+
+  return { board, hands, turn: turnText === "w" ? 1 : 0 };
+}
+
 /**
  * 解析にかけられる局面か。**駄目な理由を返すだけで、直したりはしない。**
  * 読めない駒があるときは呼び出し側で確認を取る。

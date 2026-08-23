@@ -18,8 +18,9 @@ const FILES = {
 
 let ctx = null;
 let master = null;
-const raw = {};   // 種類 → ArrayBuffer[]
-const buf = {};   // 種類 → AudioBuffer[]
+const raw = {};    // 種類 → ArrayBuffer[]（同梱の音）
+const custom = {}; // 種類 → ArrayBuffer[]（使う人が差し替えた音。あればこちらが優先）
+const buf = {};    // 種類 → AudioBuffer[]（鳴らすもの）
 
 // AudioContext は最初の操作までは作れないが、読み込みだけは先に始めておく
 const loading = Promise.all(
@@ -50,17 +51,48 @@ export function initAudio() {
   master.connect(comp);
 
   loading.then(async () => {
-    for (const kind of Object.keys(raw)) {
-      if (!raw[kind]) continue;
-      buf[kind] = await Promise.all(
-        // decodeAudioData は元の ArrayBuffer を空にするので複製を渡す
-        raw[kind].map((ab) => ctx.decodeAudioData(ab.slice(0)))
-      );
-    }
+    for (const kind of Object.keys(FILES)) await decodeKind(kind);
   }).catch((e) => { console.warn("効果音を復号できませんでした:", e); });
 
   return ctx;
 }
+
+/** その種類の音を鳴らせる形にする。差し替えた音があればそちらを使う。 */
+async function decodeKind(kind) {
+  if (!ctx) return;
+  const src = custom[kind] || raw[kind];
+  if (!src || !src.length) { delete buf[kind]; return; }
+  // decodeAudioData は元の ArrayBuffer を空にするので複製を渡す
+  buf[kind] = await Promise.all(src.map((ab) => ctx.decodeAudioData(ab.slice(0))));
+}
+
+/**
+ * 効果音を差し替える。`list` は wav などの ArrayBuffer の配列で、
+ * null か空を渡すと同梱の音に戻る。
+ *
+ * **`FILES` は触らない。** 同梱の音は公開用と個人用で本数が違うので、
+ * そこを書き換えると版どうしの差が広がる。差し替えは別に持って上書きするだけにする。
+ *
+ * 読めない音を渡されたら false（呼んだ側が知らせる）。**そのとき元の音は壊さない。**
+ */
+export async function setSound(kind, list) {
+  if (!FILES[kind]) return false;
+  const before = custom[kind];
+  if (!list || !list.length) delete custom[kind];
+  else custom[kind] = list;
+  try {
+    await decodeKind(kind);
+    return true;
+  } catch (e) {
+    console.warn(`効果音（${kind}）を復号できませんでした:`, e);
+    if (before) custom[kind] = before; else delete custom[kind];
+    await decodeKind(kind).catch(() => {});
+    return false;
+  }
+}
+
+/** その種類が差し替えられているか。 */
+export function isCustomSound(kind) { return !!custom[kind]; }
 
 export function resumeAudio() {
   if (ctx && ctx.state === "suspended") ctx.resume();
